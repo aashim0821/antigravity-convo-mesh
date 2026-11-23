@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "convo-mesh": {
+      "command": "python3",
+      "type": "stdio",
+      "args": [
+        "-u",
+        "mcp/server.py"
+      ]
+    }
+  }
+}

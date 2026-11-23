@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Validate JSON manifests and SKILL.md frontmatter
+        run: |
+          python -c "
+          import json
+          from pathlib import Path
+
+          for name in ('plugin.json', 'hooks.json', 'mcp_config.json'):
+              data = json.loads(Path(name).read_text(encoding='utf-8'))
+              assert isinstance(data, dict) and data, f'{name} must be a non-empty JSON object'
+
+          skill = Path('skills/convo-mesh/SKILL.md').read_text(encoding='utf-8')
+          assert skill.startswith('---\n') or skill.startswith('---\r\n'), 'SKILL.md missing frontmatter'
+          assert 'name: convo-mesh' in skill, 'SKILL.md missing name field'
+          assert 'description:' in skill, 'SKILL.md missing description field'
+          print('Manifests and SKILL.md validated.')
+          "
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v

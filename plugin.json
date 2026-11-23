@@ -1,0 +1,24 @@
+{
+  "name": "convo-mesh",
+  "displayName": "Convo Mesh",
+  "version": "1.0.0",
+  "description": "Whole-Antigravity cross-conversation coordination: automatic soft/strict focus locks, direct/alias/workspace/broadcast messaging, shared blackboard, file collision warnings, and structured handoffs.",
+  "author": {
+    "name": "Aashim",
+    "url": "https://github.com/aashim0821"
+  },
+  "homepage": "https://github.com/aashim0821/antigravity-convo-mesh",
+  "repository": "https://github.com/aashim0821/antigravity-convo-mesh",
+  "license": "MIT",
+  "keywords": [
+    "antigravity",
+    "agent-skills",
+    "coordination",
+    "focus",
+    "messaging",
+    "blackboard",
+    "handoff",
+    "hooks",
+    "mcp"
+  ]
+}

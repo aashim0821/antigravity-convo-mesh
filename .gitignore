@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# SQLite / Runtime state
+*.db
+*.db-wal
+*.db-shm
+hook_errors.log
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
