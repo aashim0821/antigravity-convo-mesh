@@ -1,9 +1,10 @@
-"""Cross-platform automated tests for the Convo Mesh plugin."""
+"""Cross-platform automated tests for the Convo Mesh plugin (Antigravity + Claude Code)."""
 
 from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -62,7 +63,6 @@ class ConvoMeshTestCase(unittest.TestCase):
         )
         self.assertEqual(lock["mode"], "soft")
 
-        # Allowed workspace should NOT trigger reminder
         allowed_res = mesh_hook.handle_event(
             {
                 "hookEventName": "PreInvocation",
@@ -74,7 +74,6 @@ class ConvoMeshTestCase(unittest.TestCase):
         )
         self.assertEqual(allowed_res, {})
 
-        # Non-allowed workspace on invocation 1 triggers soft reminder
         res1 = mesh_hook.handle_event(
             {
                 "hookEventName": "PreInvocation",
@@ -88,7 +87,6 @@ class ConvoMeshTestCase(unittest.TestCase):
         self.assertIn("[CONVO-MESH FOCUS REMINDER]", text1)
         self.assertIn("Master Antigravity", text1)
 
-        # Invocation 2 in same turn must NOT spam
         res2 = mesh_hook.handle_event(
             {
                 "hookEventName": "PreInvocation",
@@ -100,7 +98,6 @@ class ConvoMeshTestCase(unittest.TestCase):
         )
         self.assertEqual(res2, {})
 
-        # Immediate next turn within soft cooldown also avoids duplicate soft spam
         res_cooldown = mesh_hook.handle_event(
             {
                 "hookEventName": "PreInvocation",
@@ -112,7 +109,6 @@ class ConvoMeshTestCase(unittest.TestCase):
         )
         self.assertEqual(res_cooldown, {})
 
-        # Upgrade to strict -> invocation 1 MUST enforce strict lock
         db.set_focus_lock(
             owner_convo_id="convo-a",
             goal="Master Antigravity",
@@ -130,7 +126,6 @@ class ConvoMeshTestCase(unittest.TestCase):
         strict_text = res_strict["injectSteps"][0]["systemMessage"]["systemMessage"]
         self.assertIn("[CONVO-MESH STRICT FOCUS LOCK]", strict_text)
 
-        # Snooze lock -> no longer blocks Convo B
         db.snooze_focus_lock(minutes=15)
         res_snoozed = mesh_hook.handle_event(
             {
@@ -169,7 +164,6 @@ class ConvoMeshTestCase(unittest.TestCase):
             body="Use Next.js App Router",
         )
 
-        # Convo B receives all three once
         res_b1 = mesh_hook.handle_event(
             {
                 "hookEventName": "PreInvocation",
@@ -185,7 +179,6 @@ class ConvoMeshTestCase(unittest.TestCase):
         self.assertIn("Standup sync at 6 PM", text_b)
         self.assertIn("Use Next.js App Router", text_b)
 
-        # Convo B receives {} on next turn (zero duplicates)
         res_b2 = mesh_hook.handle_event(
             {
                 "hookEventName": "PreInvocation",
@@ -197,7 +190,6 @@ class ConvoMeshTestCase(unittest.TestCase):
         )
         self.assertEqual(res_b2, {})
 
-        # Convo A must NOT receive its own broadcast
         res_a = mesh_hook.handle_event(
             {
                 "hookEventName": "PreInvocation",
@@ -219,7 +211,6 @@ class ConvoMeshTestCase(unittest.TestCase):
             target_type="next_any",
         )
 
-        # Brand-new Convo C claims it on SessionStart
         res_c = mesh_hook.handle_event(
             {
                 "hookEventName": "SessionStart",
@@ -232,7 +223,6 @@ class ConvoMeshTestCase(unittest.TestCase):
         self.assertIn("Completed Prisma schema migration", text_c)
         self.assertIn("Run seed script", text_c)
 
-        # Convo D on SessionStart does NOT get the already-claimed handoff
         res_d = mesh_hook.handle_event(
             {
                 "hookEventName": "SessionStart",
@@ -285,7 +275,6 @@ class ConvoMeshTestCase(unittest.TestCase):
             namespace="global",
             author_convo_id="convo-a",
         )
-        # Insert an already-expired key directly to verify expiry pruning
         conn = db.connect()
         try:
             conn.execute(
@@ -328,6 +317,7 @@ class ConvoMeshTestCase(unittest.TestCase):
                     "arguments": {
                         "conversation_id": "mcp-convo-1",
                         "alias": "planner",
+                        "client": "claude-code",
                         "workspace_path": "/workspace/demo",
                         "current_goal": "Verify MCP server",
                     },
@@ -354,9 +344,9 @@ class ConvoMeshTestCase(unittest.TestCase):
                     "name": "send_message",
                     "arguments": {
                         "sender_convo_id": "mcp-convo-1",
-                        "target_type": "broadcast",
-                        "target_value": "*",
-                        "body": "Mesh online",
+                        "target_type": "client",
+                        "target_value": "antigravity",
+                        "body": "Mesh online across agents",
                     },
                 },
             },
@@ -382,7 +372,7 @@ class ConvoMeshTestCase(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 8,
                 "method": "tools/call",
-                "params": {"name": "list_convos", "arguments": {"hours_back": 24}},
+                "params": {"name": "list_convos", "arguments": {"hours_back": 24, "client": "claude-code"}},
             },
             {"jsonrpc": "2.0", "id": 9, "method": "resources/list", "params": {}},
             {
@@ -422,6 +412,7 @@ class ConvoMeshTestCase(unittest.TestCase):
 
         convos = json.loads(by_id[8]["result"]["content"][0]["text"])
         self.assertEqual(convos[0]["alias"], "planner")
+        self.assertEqual(convos[0]["client"], "claude-code")
 
         uris = {r["uri"] for r in by_id[9]["result"]["resources"]}
         self.assertEqual(uris, {"convo-mesh://status", "convo-mesh://blackboard"})
@@ -478,6 +469,132 @@ class ConvoMeshTestCase(unittest.TestCase):
         self.assertIn("[CONVO-MESH COLLISION WARNING]", text_b)
         self.assertIn("/users/dev/project/src/app.py", text_b)
         self.assertIn("@backend-dev", text_b)
+
+    def test_10_claude_code_hooks_cross_agent_bridge_and_quota_continuity(self) -> None:
+        # 1. Antigravity session works in /workspace/saas, edits a file, sets a prompt, and sends a message to client:claude-code
+        db.upsert_conversation(
+            "agy-session-1",
+            workspace_path="/workspace/saas",
+            alias="agy-architect",
+            goal="Implement billing webhook",
+            last_user_input="Finish Stripe webhook signature check",
+            client="antigravity",
+        )
+        db.record_file_touch(
+            "agy-session-1",
+            "/workspace/saas/src/webhook.ts",
+            workspace_path="/workspace/saas",
+            tool_name="edit_file",
+        )
+        db.send_message(
+            sender_convo_id="agy-session-1",
+            target_type="client",
+            target_value="claude-code",
+            body="Antigravity quota reached; finish unit tests for webhook.ts",
+            priority="urgent",
+        )
+
+        # 2. User opens Claude Code in /workspace/saas -> SessionStart fires
+        claude_start = mesh_hook.handle_event(
+            {
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-sess-1",
+                "cwd": "/workspace/saas",
+            }
+        )
+        self.assertIn("hookSpecificOutput", claude_start)
+        self.assertEqual(claude_start["hookSpecificOutput"]["hookEventName"], "SessionStart")
+        ctx = claude_start["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("[CONVO-MESH INCOMING MESSAGE]", ctx)
+        self.assertIn("Antigravity quota reached; finish unit tests for webhook.ts", ctx)
+        self.assertIn("[CONVO-MESH WORKSPACE CONTINUITY]", ctx)
+        self.assertIn("Finish Stripe webhook signature check", ctx)
+        self.assertIn("/workspace/saas/src/webhook.ts", ctx)
+
+        # 3. Claude Code edits a file via PostToolUse (Write/Edit) and sends message back to client:antigravity
+        mesh_hook.handle_event(
+            {
+                "hook_event_name": "PostToolUse",
+                "session_id": "claude-sess-1",
+                "cwd": "/workspace/saas",
+                "tool_name": "Edit",
+                "tool_input": {"file_path": "/workspace/saas/tests/webhook.test.ts"},
+            }
+        )
+        db.send_message(
+            sender_convo_id="claude-sess-1",
+            target_type="client",
+            target_value="antigravity",
+            body="Webhook tests passing in Claude Code",
+        )
+
+        # 4. Antigravity session resumes -> receives Claude's message AND collision warning on /workspace/saas
+        agy_resume = mesh_hook.handle_event(
+            {
+                "hookEventName": "PreInvocation",
+                "conversationId": "agy-session-1",
+                "workspacePaths": ["/workspace/saas"],
+                "invocationNum": 1,
+                "lastUserInput": "Check status",
+            }
+        )
+        agy_text = agy_resume["injectSteps"][0]["systemMessage"]["systemMessage"]
+        self.assertIn("[CONVO-MESH INCOMING MESSAGE]", agy_text)
+        self.assertIn("Webhook tests passing in Claude Code", agy_text)
+        self.assertIn("[CONVO-MESH COLLISION WARNING]", agy_text)
+        self.assertIn("[claude-code]", agy_text)
+        self.assertIn("/workspace/saas/tests/webhook.test.ts", agy_text)
+
+    def test_11_legacy_v1_schema_migration(self) -> None:
+        # Simulate a v1.0 database without `client` column or `client` in CHECK constraints
+        raw_conn = sqlite3.connect(str(self.db_path))
+        raw_conn.executescript(
+            """
+            CREATE TABLE conversations (
+                conversation_id TEXT PRIMARY KEY,
+                alias TEXT UNIQUE,
+                workspace_path TEXT NOT NULL DEFAULT '',
+                current_goal TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                last_user_input TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                last_turn_at TEXT NOT NULL
+            );
+            INSERT INTO conversations VALUES (
+                'legacy-1', 'old-chat', 'd:/Legacy', 'Test migration', 'active', 'hi',
+                '2026-11-23T00:00:00.000000Z', '2026-11-25T00:00:00.000000Z', '2026-11-25T00:00:00.000000Z'
+            );
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_convo_id TEXT NOT NULL,
+                sender_alias TEXT NOT NULL DEFAULT '',
+                sender_workspace TEXT NOT NULL DEFAULT '',
+                target_type TEXT NOT NULL CHECK(target_type IN ('convo', 'alias', 'workspace', 'broadcast')),
+                target_value TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('info', 'normal', 'reminder', 'urgent')),
+                subject TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL,
+                reply_to INTEGER,
+                expires_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        raw_conn.close()
+
+        # Connecting via db.connect() must auto-migrate v1.0 -> v1.1 without losing legacy-1
+        msg = db.send_message(
+            sender_convo_id="legacy-1",
+            target_type="client",
+            target_value="claude-code",
+            body="Migrated message to Claude",
+        )
+        self.assertEqual(msg["target_type"], "client")
+        convos = db.list_conversations(hours_back=9999)
+        self.assertEqual(len(convos), 1)
+        self.assertEqual(convos[0]["conversation_id"], "legacy-1")
+        self.assertEqual(convos[0]["client"], "antigravity")
 
 
 if __name__ == "__main__":

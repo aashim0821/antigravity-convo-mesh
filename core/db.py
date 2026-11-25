@@ -1,4 +1,4 @@
-"""Zero-dependency SQLite WAL engine for Convo Mesh cross-conversation coordination."""
+"""Zero-dependency SQLite WAL engine for Convo Mesh cross-conversation & cross-agent coordination."""
 
 from __future__ import annotations
 
@@ -60,7 +60,7 @@ def parse_iso(ts: str | None) -> datetime | None:
 
 
 def normalize_path(path_str: str | None) -> str:
-    """Normalize filesystem paths for cross-format comparison on Windows."""
+    """Normalize filesystem paths for cross-format comparison on Windows and POSIX."""
     if not path_str:
         return ""
     norm = path_str.strip().replace("\\", "/")
@@ -84,13 +84,95 @@ def _workspace_matches(target: str | None, candidate: str | None) -> bool:
     return t_norm in c_norm or c_norm in t_norm
 
 
+def _migrate_v1_to_v1_1(conn: sqlite3.Connection) -> None:
+    """Seamlessly upgrade v1.0 tables to support cross-agent client tracking and target_type='client'."""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(conversations);").fetchall()]
+    if cols and "client" not in cols:
+        conn.execute("ALTER TABLE conversations ADD COLUMN client TEXT NOT NULL DEFAULT 'antigravity';")
+
+    msg_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages';"
+    ).fetchone()
+    if msg_sql_row and msg_sql_row[0] and "'client'" not in msg_sql_row[0]:
+        conn.executescript(
+            """
+            PRAGMA foreign_keys=OFF;
+            BEGIN IMMEDIATE;
+            CREATE TABLE messages_v11 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_convo_id TEXT NOT NULL,
+                sender_alias TEXT NOT NULL DEFAULT '',
+                sender_workspace TEXT NOT NULL DEFAULT '',
+                target_type TEXT NOT NULL CHECK(target_type IN ('convo', 'alias', 'workspace', 'client', 'broadcast')),
+                target_value TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('info', 'normal', 'reminder', 'urgent')),
+                subject TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL,
+                reply_to INTEGER,
+                expires_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO messages_v11 (
+                id, sender_convo_id, sender_alias, sender_workspace, target_type,
+                target_value, priority, subject, body, reply_to, expires_at, created_at
+            )
+            SELECT
+                id, sender_convo_id, sender_alias, sender_workspace, target_type,
+                target_value, priority, subject, body, reply_to, expires_at, created_at
+            FROM messages;
+            DROP TABLE messages;
+            ALTER TABLE messages_v11 RENAME TO messages;
+            CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+            COMMIT;
+            PRAGMA foreign_keys=ON;
+            """
+        )
+
+    ho_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='handoffs';"
+    ).fetchone()
+    if ho_sql_row and ho_sql_row[0] and "'client'" not in ho_sql_row[0]:
+        conn.executescript(
+            """
+            BEGIN IMMEDIATE;
+            CREATE TABLE handoffs_v11 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                from_convo_id TEXT NOT NULL,
+                from_alias TEXT NOT NULL DEFAULT '',
+                from_workspace TEXT NOT NULL DEFAULT '',
+                target_type TEXT NOT NULL DEFAULT 'next_any' CHECK(target_type IN ('next_any', 'convo', 'alias', 'workspace', 'client')),
+                target_value TEXT NOT NULL DEFAULT '*',
+                summary TEXT NOT NULL,
+                next_steps_json TEXT NOT NULL DEFAULT '[]',
+                key_files_json TEXT NOT NULL DEFAULT '[]',
+                claimed_by_convo_id TEXT,
+                claimed_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO handoffs_v11 (
+                id, from_convo_id, from_alias, from_workspace, target_type, target_value,
+                summary, next_steps_json, key_files_json, claimed_by_convo_id, claimed_at, created_at
+            )
+            SELECT
+                id, from_convo_id, from_alias, from_workspace, target_type, target_value,
+                summary, next_steps_json, key_files_json, claimed_by_convo_id, claimed_at, created_at
+            FROM handoffs;
+            DROP TABLE handoffs;
+            ALTER TABLE handoffs_v11 RENAME TO handoffs;
+            CREATE INDEX IF NOT EXISTS idx_handoffs_claimed ON handoffs(claimed_by_convo_id, created_at);
+            COMMIT;
+            """
+        )
+
+
 def init_db(conn: sqlite3.Connection) -> None:
-    """Create all Convo Mesh tables and indexes if they do not exist."""
+    """Create all Convo Mesh tables and indexes if they do not exist, and run v1.1 migrations."""
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS conversations (
             conversation_id TEXT PRIMARY KEY,
             alias TEXT UNIQUE,
+            client TEXT NOT NULL DEFAULT 'antigravity',
             workspace_path TEXT NOT NULL DEFAULT '',
             current_goal TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'active',
@@ -121,7 +203,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             sender_convo_id TEXT NOT NULL,
             sender_alias TEXT NOT NULL DEFAULT '',
             sender_workspace TEXT NOT NULL DEFAULT '',
-            target_type TEXT NOT NULL CHECK(target_type IN ('convo', 'alias', 'workspace', 'broadcast')),
+            target_type TEXT NOT NULL CHECK(target_type IN ('convo', 'alias', 'workspace', 'client', 'broadcast')),
             target_value TEXT NOT NULL DEFAULT '',
             priority TEXT NOT NULL DEFAULT 'normal' CHECK(priority IN ('info', 'normal', 'reminder', 'urgent')),
             subject TEXT NOT NULL DEFAULT '',
@@ -180,7 +262,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             from_convo_id TEXT NOT NULL,
             from_alias TEXT NOT NULL DEFAULT '',
             from_workspace TEXT NOT NULL DEFAULT '',
-            target_type TEXT NOT NULL DEFAULT 'next_any' CHECK(target_type IN ('next_any', 'convo', 'alias', 'workspace')),
+            target_type TEXT NOT NULL DEFAULT 'next_any' CHECK(target_type IN ('next_any', 'convo', 'alias', 'workspace', 'client')),
             target_value TEXT NOT NULL DEFAULT '*',
             summary TEXT NOT NULL,
             next_steps_json TEXT NOT NULL DEFAULT '[]',
@@ -196,6 +278,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_handoffs_claimed ON handoffs(claimed_by_convo_id, created_at);
         """
     )
+    _migrate_v1_to_v1_1(conn)
 
 
 def connect() -> sqlite3.Connection:
@@ -211,12 +294,6 @@ def connect() -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     init_db(conn)
     return conn
-
-
-def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
-    if row is None:
-        return None
-    return dict(row)
 
 
 def _format_lock(row: sqlite3.Row) -> dict[str, Any]:
@@ -262,6 +339,7 @@ def upsert_conversation(
     goal: str | None = None,
     status: str | None = None,
     mark_turn: bool = False,
+    client: str | None = None,
 ) -> dict[str, Any]:
     """Insert or update a conversation record while preserving omitted metadata."""
     clean_id = (convo_id or "").strip()
@@ -270,6 +348,7 @@ def upsert_conversation(
 
     now = utc_now_iso()
     clean_alias = alias.strip() if alias and alias.strip() else None
+    clean_client = client.strip().lower() if client and client.strip() else None
     clean_ws = workspace_path.strip() if workspace_path else ""
     clean_goal = goal.strip() if goal is not None else None
     clean_status = status.strip() if status is not None and status.strip() else None
@@ -292,13 +371,14 @@ def upsert_conversation(
             conn.execute(
                 """
                 INSERT INTO conversations (
-                    conversation_id, alias, workspace_path, current_goal, status,
+                    conversation_id, alias, client, workspace_path, current_goal, status,
                     last_user_input, first_seen_at, last_seen_at, last_turn_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     clean_id,
                     clean_alias,
+                    clean_client or "antigravity",
                     clean_ws,
                     clean_goal or "",
                     clean_status or "active",
@@ -310,6 +390,7 @@ def upsert_conversation(
             )
         else:
             final_alias = clean_alias if clean_alias is not None else existing["alias"]
+            final_client = clean_client if clean_client is not None else (existing["client"] or "antigravity")
             final_ws = clean_ws if clean_ws else existing["workspace_path"]
             final_goal = clean_goal if clean_goal is not None else existing["current_goal"]
             final_status = clean_status if clean_status is not None else existing["status"]
@@ -319,12 +400,13 @@ def upsert_conversation(
             conn.execute(
                 """
                 UPDATE conversations
-                SET alias = ?, workspace_path = ?, current_goal = ?, status = ?,
+                SET alias = ?, client = ?, workspace_path = ?, current_goal = ?, status = ?,
                     last_user_input = ?, last_seen_at = ?, last_turn_at = ?
                 WHERE conversation_id = ?
                 """,
                 (
                     final_alias,
+                    final_client,
                     final_ws,
                     final_goal,
                     final_status,
@@ -351,6 +433,7 @@ def list_conversations(
     hours_back: float = 24.0,
     status: str | None = None,
     workspace: str | None = None,
+    client: str | None = None,
 ) -> list[dict[str, Any]]:
     """List conversations seen within the given lookback window."""
     cutoff = utc_offset_iso(-abs(hours_back) * 60.0)
@@ -361,11 +444,68 @@ def list_conversations(
         if status and status.strip():
             query += " AND status = ?"
             params.append(status.strip())
+        if client and client.strip():
+            query += " AND LOWER(client) = LOWER(?)"
+            params.append(client.strip())
         query += " ORDER BY last_seen_at DESC"
         rows = [dict(r) for r in conn.execute(query, params).fetchall()]
         if workspace and workspace.strip():
             rows = [r for r in rows if _workspace_matches(workspace, r.get("workspace_path"))]
         return rows
+    finally:
+        conn.close()
+
+
+def get_workspace_continuity(
+    convo_id: str,
+    workspace_path: str,
+    hours_back: float = 2.0,
+) -> dict[str, Any] | None:
+    """Find the most recent in-flight conversation & touched files in the same workspace (for quota/agent failover)."""
+    ws_norm = normalize_path(workspace_path)
+    if not ws_norm:
+        return None
+    cutoff = utc_offset_iso(-abs(hours_back) * 60.0)
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM conversations
+            WHERE conversation_id != ? AND last_seen_at >= ?
+            ORDER BY last_seen_at DESC
+            """,
+            (convo_id, cutoff),
+        ).fetchall()
+
+        prev_convo: dict[str, Any] | None = None
+        for r in rows:
+            if _workspace_matches(ws_norm, r["workspace_path"]):
+                prev_convo = dict(r)
+                break
+
+        if prev_convo is None:
+            return None
+
+        touch_rows = conn.execute(
+            """
+            SELECT file_path, tool_name, touched_at
+            FROM file_touches
+            WHERE convo_id = ? AND touched_at >= ?
+            ORDER BY touched_at DESC
+            LIMIT 8
+            """,
+            (prev_convo["conversation_id"], cutoff),
+        ).fetchall()
+        recent_files = [r["file_path"] for r in touch_rows]
+
+        # Only emit continuity when the previous session had active context (goal, prompt, or file edits)
+        if not prev_convo.get("current_goal") and not prev_convo.get("last_user_input") and not recent_files:
+            return None
+
+        return {
+            "previous_convo": prev_convo,
+            "recent_files": recent_files,
+        }
     finally:
         conn.close()
 
@@ -603,11 +743,11 @@ def send_message(
     reply_to: int | None = None,
     ttl_minutes: float | None = None,
 ) -> dict[str, Any]:
-    """Send a direct, alias, workspace-scoped, or broadcast message."""
+    """Send a direct, alias, workspace-scoped, client-scoped (e.g. 'claude-code'/'antigravity'), or broadcast message."""
     clean_sender = resolve_convo_id(sender_convo_id)
     clean_type = (target_type or "").strip().lower()
-    if clean_type not in ("convo", "alias", "workspace", "broadcast"):
-        raise ValueError("target_type must be one of: convo, alias, workspace, broadcast")
+    if clean_type not in ("convo", "alias", "workspace", "client", "broadcast"):
+        raise ValueError("target_type must be one of: convo, alias, workspace, client, broadcast")
 
     clean_priority = (priority or "normal").strip().lower()
     if clean_priority not in ("info", "normal", "reminder", "urgent"):
@@ -668,11 +808,26 @@ def send_message(
         conn.close()
 
 
+def _client_matches(target_val: str, convo_client: str) -> bool:
+    t = (target_val or "").strip().lower()
+    c = (convo_client or "antigravity").strip().lower()
+    if not t or not c:
+        return False
+    if t == c:
+        return True
+    if t in ("claude", "claude-code", "claudecode") and "claude" in c:
+        return True
+    if t in ("agy", "antigravity") and "antigravity" in c:
+        return True
+    return t in c or c in t
+
+
 def _message_matches_recipient(
     msg_row: sqlite3.Row,
     convo_id: str,
     convo_alias: str,
     workspace_path: str,
+    convo_client: str = "antigravity",
 ) -> bool:
     ttype = msg_row["target_type"]
     tval = (msg_row["target_value"] or "").strip()
@@ -684,20 +839,25 @@ def _message_matches_recipient(
         return bool(convo_alias) and tval.lower() == convo_alias.strip().lower()
     if ttype == "workspace":
         return bool(workspace_path) and _workspace_matches(tval, workspace_path)
+    if ttype == "client":
+        return _client_matches(tval, convo_client)
     return False
 
 
-def pop_undelivered_messages(convo_id: str, workspace_path: str = "") -> list[dict[str, Any]]:
+def pop_undelivered_messages(convo_id: str, workspace_path: str = "", client: str = "") -> list[dict[str, Any]]:
     """Atomically fetch and mark delivered any unread/undelivered messages for convo_id."""
     now = utc_now_iso()
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
         convo_row = conn.execute(
-            "SELECT alias, workspace_path FROM conversations WHERE conversation_id = ?",
+            "SELECT alias, client, workspace_path FROM conversations WHERE conversation_id = ?",
             (convo_id,),
         ).fetchone()
         convo_alias = (convo_row["alias"] or "") if convo_row else ""
+        convo_client = client.strip() if client.strip() else (
+            (convo_row["client"] or "antigravity") if convo_row else "antigravity"
+        )
         effective_ws = workspace_path.strip() if workspace_path.strip() else (
             (convo_row["workspace_path"] or "") if convo_row else ""
         )
@@ -719,7 +879,7 @@ def pop_undelivered_messages(convo_id: str, workspace_path: str = "") -> list[di
 
         matched: list[dict[str, Any]] = []
         for r in rows:
-            if _message_matches_recipient(r, convo_id, convo_alias, effective_ws):
+            if _message_matches_recipient(r, convo_id, convo_alias, effective_ws, convo_client):
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO message_deliveries (message_id, recipient_convo_id, delivered_at)
@@ -749,10 +909,11 @@ def read_inbox(
     conn = connect()
     try:
         convo_row = conn.execute(
-            "SELECT alias, workspace_path FROM conversations WHERE conversation_id = ?",
+            "SELECT alias, client, workspace_path FROM conversations WHERE conversation_id = ?",
             (clean_id,),
         ).fetchone()
         convo_alias = (convo_row["alias"] or "") if convo_row else ""
+        convo_client = (convo_row["client"] or "antigravity") if convo_row else "antigravity"
         effective_ws = (convo_row["workspace_path"] or "") if convo_row else ""
 
         rows = conn.execute(
@@ -770,7 +931,7 @@ def read_inbox(
 
         results: list[dict[str, Any]] = []
         for r in rows:
-            if not _message_matches_recipient(r, clean_id, convo_alias, effective_ws):
+            if not _message_matches_recipient(r, clean_id, convo_alias, effective_ws, convo_client):
                 continue
             if not include_acknowledged and r["acknowledged_at"] is not None:
                 continue
@@ -990,7 +1151,7 @@ def check_workspace_collisions(
         rows = conn.execute(
             """
             SELECT ft.file_path, ft.convo_id, ft.workspace_path, ft.tool_name, ft.touched_at,
-                   c.alias AS convo_alias
+                   c.alias AS convo_alias, c.client AS convo_client
             FROM file_touches ft
             LEFT JOIN conversations c ON c.conversation_id = ft.convo_id
             WHERE ft.convo_id != ? AND ft.touched_at >= ?
@@ -1016,6 +1177,7 @@ def check_workspace_collisions(
                 {
                     "convo_id": other_id,
                     "alias": r["convo_alias"] or "",
+                    "client": r["convo_client"] or "antigravity",
                     "files": [],
                     "last_touched_at": r["touched_at"],
                 },
@@ -1059,7 +1221,7 @@ def get_workspace_activity(workspace: str | None = None, minutes_back: float = 3
     try:
         rows = conn.execute(
             """
-            SELECT ft.*, c.alias AS convo_alias
+            SELECT ft.*, c.alias AS convo_alias, c.client AS convo_client
             FROM file_touches ft
             LEFT JOIN conversations c ON c.conversation_id = ft.convo_id
             WHERE ft.touched_at >= ?
@@ -1089,15 +1251,15 @@ def create_handoff(
     target_type: str = "next_any",
     target_value: str = "*",
 ) -> dict[str, Any]:
-    """Create a structured handoff packet for another (or next new) conversation."""
+    """Create a structured handoff packet for another (or next new) conversation or agent client."""
     clean_from = resolve_convo_id(from_convo_id)
     clean_summary = (summary or "").strip()
     if not clean_summary:
         raise ValueError("summary must be non-empty")
 
     clean_type = (target_type or "next_any").strip().lower()
-    if clean_type not in ("next_any", "convo", "alias", "workspace"):
-        raise ValueError("target_type must be one of: next_any, convo, alias, workspace")
+    if clean_type not in ("next_any", "convo", "alias", "workspace", "client"):
+        raise ValueError("target_type must be one of: next_any, convo, alias, workspace, client")
 
     clean_target = (target_value or "").strip()
     if clean_type == "next_any" and not clean_target:
@@ -1149,17 +1311,20 @@ def create_handoff(
         conn.close()
 
 
-def claim_matching_handoffs(convo_id: str, workspace_path: str = "") -> list[dict[str, Any]]:
-    """Atomically claim unclaimed handoffs matching convo_id, its alias, workspace, or next_any."""
+def claim_matching_handoffs(convo_id: str, workspace_path: str = "", client: str = "") -> list[dict[str, Any]]:
+    """Atomically claim unclaimed handoffs matching convo_id, its alias, workspace, client, or next_any."""
     now = utc_now_iso()
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
         convo_row = conn.execute(
-            "SELECT alias, workspace_path FROM conversations WHERE conversation_id = ?",
+            "SELECT alias, client, workspace_path FROM conversations WHERE conversation_id = ?",
             (convo_id,),
         ).fetchone()
         convo_alias = (convo_row["alias"] or "") if convo_row else ""
+        convo_client = client.strip() if client.strip() else (
+            (convo_row["client"] or "antigravity") if convo_row else "antigravity"
+        )
         effective_ws = workspace_path.strip() if workspace_path.strip() else (
             (convo_row["workspace_path"] or "") if convo_row else ""
         )
@@ -1183,6 +1348,7 @@ def claim_matching_handoffs(convo_id: str, workspace_path: str = "") -> list[dic
                 or (ttype == "convo" and tval == convo_id)
                 or (ttype == "alias" and bool(convo_alias) and tval.lower() == convo_alias.strip().lower())
                 or (ttype == "workspace" and bool(effective_ws) and _workspace_matches(tval, effective_ws))
+                or (ttype == "client" and _client_matches(tval, convo_client))
             )
             if not matched:
                 continue
@@ -1206,10 +1372,10 @@ def get_mesh_status() -> dict[str, Any]:
     """Return an overview snapshot of active conversations, locks, messages, and blackboard state."""
     db_path = get_db_path()
     now = utc_now_iso()
+    active_convos = list_conversations(hours_back=24)
+    active_locks = get_active_focus_locks(include_paused=True)
     conn = connect()
     try:
-        active_convos = list_conversations(hours_back=24)
-        active_locks = get_active_focus_locks(include_paused=True)
         total_msgs = conn.execute("SELECT COUNT(*) AS c FROM messages").fetchone()["c"]
         unclaimed_handoffs = conn.execute(
             "SELECT COUNT(*) AS c FROM handoffs WHERE claimed_by_convo_id IS NULL"

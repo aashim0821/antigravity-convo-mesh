@@ -1,8 +1,9 @@
-"""Fail-open Antigravity lifecycle hook handler for Convo Mesh."""
+"""Fail-open dual-host (Antigravity + Claude Code) lifecycle hook handler for Convo Mesh."""
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -15,17 +16,81 @@ if str(PLUGIN_ROOT) not in sys.path:
 from core import db
 
 
-def _extract_workspace(payload: dict[str, Any]) -> str:
+def _detect_host_and_normalize(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize either an Antigravity or Claude Code hook stdin payload."""
+    is_claude = ("hook_event_name" in payload or "session_id" in payload) and ("hookEventName" not in payload)
+    if is_claude:
+        raw_event = str(payload.get("hook_event_name") or "").strip()
+        convo_id = str(payload.get("session_id") or "").strip()
+        workspace = str(payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or "").strip()
+
+        if raw_event == "SessionStart":
+            event = "SessionStart"
+        elif raw_event in ("UserPromptSubmit", "PreInvocation"):
+            event = "PreInvocation"
+        elif raw_event == "PostToolUse":
+            event = "PostToolUse"
+        elif raw_event == "Stop":
+            event = "Stop"
+        else:
+            event = raw_event
+
+        last_input = payload.get("prompt") if "prompt" in payload else payload.get("lastUserInput")
+        tool_name = str(payload.get("tool_name") or "").strip()
+        tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+        file_path = str(
+            tool_input.get("file_path") or tool_input.get("path") or tool_input.get("Path") or ""
+        ).strip()
+
+        return {
+            "host": "claude-code",
+            "raw_event": raw_event or event,
+            "event": event,
+            "convo_id": convo_id,
+            "workspace": workspace,
+            "invocation_num": 1,
+            "last_input": last_input,
+            "tool_name": tool_name,
+            "file_path": file_path,
+        }
+
+    # Antigravity payload
+    raw_event = str(payload.get("hookEventName") or "").strip()
+    convo_id = str(payload.get("conversationId") or "").strip()
     ws_paths = payload.get("workspacePaths")
-    if isinstance(ws_paths, list) and ws_paths:
-        first = str(ws_paths[0] or "").strip()
-        if first:
-            return first
-    return str(payload.get("cwd") or "").strip()
+    if isinstance(ws_paths, list) and ws_paths and str(ws_paths[0] or "").strip():
+        workspace = str(ws_paths[0]).strip()
+    else:
+        workspace = str(payload.get("cwd") or "").strip()
+
+    raw_inv = payload.get("invocationNum")
+    try:
+        invocation_num = int(raw_inv) if raw_inv is not None else 1
+    except (TypeError, ValueError):
+        invocation_num = 1
+
+    tool_call = payload.get("toolCall") if isinstance(payload.get("toolCall"), dict) else {}
+    tool_name = str(tool_call.get("name") or "").strip()
+    args = tool_call.get("args") if isinstance(tool_call.get("args"), dict) else {}
+    file_path = str(args.get("Path") or args.get("path") or args.get("file_path") or "").strip()
+
+    return {
+        "host": "antigravity",
+        "raw_event": raw_event,
+        "event": raw_event,
+        "convo_id": convo_id,
+        "workspace": workspace,
+        "invocation_num": invocation_num,
+        "last_input": payload.get("lastUserInput"),
+        "tool_name": tool_name,
+        "file_path": file_path,
+    }
 
 
-def _label_sender(alias: str, convo_id: str, workspace: str) -> str:
+def _label_sender(alias: str, convo_id: str, workspace: str, client: str = "") -> str:
     parts = []
+    if client:
+        parts.append(f"[{client}]")
     if alias:
         parts.append(f"@{alias}")
     if convo_id:
@@ -107,16 +172,40 @@ def _format_handoff_blocks(handoffs: list[dict[str, Any]]) -> list[str]:
     return blocks
 
 
+def _format_continuity_block(continuity: dict[str, Any] | None) -> list[str]:
+    if not continuity:
+        return []
+    prev = continuity["previous_convo"]
+    recent_files = continuity.get("recent_files") or []
+    who = _label_sender(
+        prev.get("alias") or "",
+        prev.get("conversation_id") or "",
+        prev.get("workspace_path") or "",
+        prev.get("client") or "antigravity",
+    )
+    goal_line = f"\nGoal: {prev['current_goal']}" if prev.get("current_goal") else ""
+    prompt_line = f"\nLast User Prompt: {prev['last_user_input']}" if prev.get("last_user_input") else ""
+    files_line = f"\nRecently Modified Files: {', '.join(recent_files)}" if recent_files else ""
+    return [
+        "[CONVO-MESH WORKSPACE CONTINUITY]\n"
+        f"Previous In-Flight Session in This Workspace: {who} (last active: {prev.get('last_seen_at')}){goal_line}{prompt_line}{files_line}\n"
+        "INSTRUCTION: If the user is continuing work or switched agents/models after a quota limit, use this context seamlessly."
+    ]
+
+
 def _format_collision_blocks(collisions: list[dict[str, Any]]) -> list[str]:
     if not collisions:
         return []
     lines = ["[CONVO-MESH COLLISION WARNING]"]
     for item in collisions:
+        client_tag = f"[{item.get('client', 'antigravity')}] " if item.get("client") else ""
         who = f"@{item['alias']} ({item['convo_id']})" if item.get("alias") else item["convo_id"]
         files = ", ".join(item.get("files", [])[:5])
         if len(item.get("files", [])) > 5:
             files += f" (+{len(item['files']) - 5} more)"
-        lines.append(f"- Convo {who} recently modified files in this workspace (last: {item['last_touched_at']}): {files}")
+        lines.append(
+            f"- {client_tag}Convo {who} recently modified files in this workspace (last: {item['last_touched_at']}): {files}"
+        )
     lines.append("INSTRUCTION: Warn the user before overwriting overlapping files or coordinate via `send_message`.")
     return ["\n".join(lines)]
 
@@ -126,17 +215,30 @@ def _format_active_convos_summary(other_convos: list[dict[str, Any]]) -> list[st
         return []
     lines = ["[CONVO-MESH ACTIVE CONVERSATIONS]"]
     for c in other_convos:
+        client_tag = f"[{c.get('client', 'antigravity')}] "
         label = f"@{c['alias']}" if c.get("alias") else c["conversation_id"]
         goal = f" | goal: {c['current_goal']}" if c.get("current_goal") else ""
         ws = c.get("workspace_path") or "no-workspace"
-        lines.append(f"- {label} ({c['conversation_id']}) [{ws}]{goal}")
+        lines.append(f"- {client_tag}{label} ({c['conversation_id']}) [{ws}]{goal}")
     return ["\n".join(lines)]
 
 
-def _build_inject_response(blocks: list[str], include_termination: bool = False) -> dict[str, Any]:
+def _build_response(
+    blocks: list[str],
+    host: str,
+    raw_event: str,
+    include_termination: bool = False,
+) -> dict[str, Any]:
     if not blocks:
         return {}
     text = "\n\n".join(blocks)
+    if host == "claude-code":
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": raw_event,
+                "additionalContext": text,
+            }
+        }
     out: dict[str, Any] = {
         "injectSteps": [
             {
@@ -152,17 +254,21 @@ def _build_inject_response(blocks: list[str], include_termination: bool = False)
 
 
 def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
-    """Handle one Antigravity hook lifecycle event."""
-    event = str(payload.get("hookEventName") or "").strip()
-    convo_id = str(payload.get("conversationId") or "").strip()
-    workspace = _extract_workspace(payload)
+    """Handle one Antigravity or Claude Code hook lifecycle event."""
+    norm = _detect_host_and_normalize(payload)
+    host = norm["host"]
+    raw_event = norm["raw_event"]
+    event = norm["event"]
+    convo_id = norm["convo_id"]
+    workspace = norm["workspace"]
 
     if event == "SessionStart":
         if convo_id:
-            db.upsert_conversation(convo_id, workspace_path=workspace, status="active")
-        handoffs = db.claim_matching_handoffs(convo_id, workspace) if convo_id else []
+            db.upsert_conversation(convo_id, workspace_path=workspace, status="active", client=host)
+        handoffs = db.claim_matching_handoffs(convo_id, workspace, client=host) if convo_id else []
         conflicts = db.check_focus_conflict(convo_id, workspace, invocation_num=1) if convo_id else []
-        messages = db.pop_undelivered_messages(convo_id, workspace) if convo_id else []
+        messages = db.pop_undelivered_messages(convo_id, workspace, client=host) if convo_id else []
+        continuity = db.get_workspace_continuity(convo_id, workspace) if (convo_id and workspace) else None
         other_convos = [
             c for c in db.list_conversations(hours_back=4) if c["conversation_id"] != convo_id
         ][:5]
@@ -171,16 +277,13 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
         blocks.extend(_format_focus_blocks(conflicts))
         blocks.extend(_format_handoff_blocks(handoffs))
         blocks.extend(_format_message_blocks(messages))
+        blocks.extend(_format_continuity_block(continuity))
         blocks.extend(_format_active_convos_summary(other_convos))
-        return _build_inject_response(blocks, include_termination=False)
+        return _build_response(blocks, host=host, raw_event=raw_event, include_termination=False)
 
     if event == "PreInvocation":
-        last_input = payload.get("lastUserInput")
-        raw_inv = payload.get("invocationNum")
-        try:
-            invocation_num = int(raw_inv) if raw_inv is not None else 1
-        except (TypeError, ValueError):
-            invocation_num = 1
+        last_input = norm["last_input"]
+        invocation_num = norm["invocation_num"]
 
         if convo_id:
             db.upsert_conversation(
@@ -189,41 +292,37 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
                 last_user_input=str(last_input) if last_input is not None else None,
                 status="active",
                 mark_turn=(invocation_num == 1),
+                client=host,
             )
 
         blocks = []
         if convo_id:
-            messages = db.pop_undelivered_messages(convo_id, workspace)
+            messages = db.pop_undelivered_messages(convo_id, workspace, client=host)
             if invocation_num == 1:
                 conflicts = db.check_focus_conflict(convo_id, workspace, invocation_num=1)
-                handoffs = db.claim_matching_handoffs(convo_id, workspace)
+                handoffs = db.claim_matching_handoffs(convo_id, workspace, client=host)
                 collisions = db.check_workspace_collisions(convo_id, workspace)
                 blocks.extend(_format_focus_blocks(conflicts))
                 blocks.extend(_format_handoff_blocks(handoffs))
                 blocks.extend(_format_collision_blocks(collisions))
             blocks.extend(_format_message_blocks(messages))
-        return _build_inject_response(blocks, include_termination=True)
+        return _build_response(blocks, host=host, raw_event=raw_event, include_termination=True)
 
     if event == "PostToolUse":
-        tool_call = payload.get("toolCall")
-        if isinstance(tool_call, dict) and convo_id:
-            tool_name = str(tool_call.get("name") or "").strip()
-            if tool_name in ("write_file", "edit_file"):
-                args = tool_call.get("args") or {}
-                if isinstance(args, dict):
-                    file_path = str(args.get("Path") or args.get("path") or "").strip()
-                    if file_path:
-                        db.record_file_touch(
-                            convo_id,
-                            file_path,
-                            workspace_path=workspace,
-                            tool_name=tool_name,
-                        )
+        tool_name = norm["tool_name"]
+        file_path = norm["file_path"]
+        if convo_id and tool_name in ("write_file", "edit_file", "Write", "Edit", "MultiEdit") and file_path:
+            db.record_file_touch(
+                convo_id,
+                file_path,
+                workspace_path=workspace,
+                tool_name=tool_name,
+            )
         return {}
 
     if event == "Stop":
         if convo_id:
-            db.upsert_conversation(convo_id, workspace_path=workspace, status="active")
+            db.upsert_conversation(convo_id, workspace_path=workspace, status="active", client=host)
         return {}
 
     return {}

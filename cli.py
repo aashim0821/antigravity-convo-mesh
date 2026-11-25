@@ -91,7 +91,6 @@ def cmd_reset_db(args: argparse.Namespace) -> int:
         if p.exists():
             p.unlink()
             removed.append(str(p))
-    # Reinitialize clean empty schema
     conn = db.connect()
     conn.close()
     _print_json({"reset": True, "removed": removed, "db_path": str(db_path)})
@@ -119,10 +118,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_clear.add_argument("--convo-id", dest="convo_id", default=None)
     p_clear.set_defaults(func=cmd_clear_focus)
 
-    p_send = sub.add_parser("send", help="Send a cross-conversation message")
-    p_send.add_argument("--to", required=True, help="Target convo ID, alias, workspace, or '*'")
+    p_send = sub.add_parser("send", help="Send a cross-conversation or cross-agent message")
+    p_send.add_argument("--to", required=True, help="Target convo ID, alias, workspace, client ('claude-code'/'antigravity'), or '*'")
     p_send.add_argument("--body", required=True, help="Message body")
-    p_send.add_argument("--type", choices=["convo", "alias", "workspace", "broadcast"], default="alias")
+    p_send.add_argument("--type", choices=["convo", "alias", "workspace", "client", "broadcast"], default="alias")
     p_send.add_argument("--from", dest="from_convo", default="cli")
     p_send.add_argument("--priority", choices=["info", "normal", "reminder", "urgent"], default="normal")
     p_send.add_argument("--subject", default="")

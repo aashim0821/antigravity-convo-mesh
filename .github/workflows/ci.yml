@@ -25,13 +25,22 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Validate JSON manifests and SKILL.md frontmatter
+      - name: Validate Antigravity and Claude Code JSON manifests and SKILL.md frontmatter
         run: |
           python -c "
           import json
           from pathlib import Path
 
-          for name in ('plugin.json', 'hooks.json', 'mcp_config.json'):
+          manifests = (
+              'plugin.json',
+              'hooks.json',
+              'mcp_config.json',
+              '.mcp.json',
+              '.claude-plugin/plugin.json',
+              '.claude-plugin/marketplace.json',
+              'hooks/claude-hooks.json',
+          )
+          for name in manifests:
               data = json.loads(Path(name).read_text(encoding='utf-8'))
               assert isinstance(data, dict) and data, f'{name} must be a non-empty JSON object'
 
@@ -39,7 +48,7 @@ jobs:
           assert skill.startswith('---\n') or skill.startswith('---\r\n'), 'SKILL.md missing frontmatter'
           assert 'name: convo-mesh' in skill, 'SKILL.md missing name field'
           assert 'description:' in skill, 'SKILL.md missing description field'
-          print('Manifests and SKILL.md validated.')
+          print('All 7 manifests and SKILL.md validated.')
           "
 
       - name: Run unit tests

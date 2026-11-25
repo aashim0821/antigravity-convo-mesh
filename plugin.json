@@ -1,8 +1,8 @@
 {
   "name": "convo-mesh",
   "displayName": "Convo Mesh",
-  "version": "1.0.0",
-  "description": "Whole-Antigravity cross-conversation coordination: automatic soft/strict focus locks, direct/alias/workspace/broadcast messaging, shared blackboard, file collision warnings, and structured handoffs.",
+  "version": "1.1.0",
+  "description": "Cross-conversation & cross-agent (Antigravity <-> Claude Code) coordination: automatic soft/strict focus locks, direct/alias/workspace/client/broadcast messaging, shared blackboard, file collision warnings, and automatic quota-failover continuity.",
   "author": {
     "name": "Aashim",
     "url": "https://github.com/aashim0821"
@@ -12,6 +12,7 @@
   "license": "MIT",
   "keywords": [
     "antigravity",
+    "claude-code",
     "agent-skills",
     "coordination",
     "focus",

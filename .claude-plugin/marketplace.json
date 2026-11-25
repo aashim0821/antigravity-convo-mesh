@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "convo-mesh",
+  "description": "Cross-conversation and cross-agent (Antigravity <-> Claude Code) coordination bus.",
+  "owner": {
+    "name": "Aashim",
+    "url": "https://github.com/aashim0821"
+  },
+  "plugins": [
+    {
+      "name": "convo-mesh",
+      "description": "Soft/strict focus locks, cross-agent messaging, shared blackboard, file collision warnings, and automatic quota-failover workspace continuity.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

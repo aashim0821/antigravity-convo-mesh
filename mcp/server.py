@@ -1,4 +1,4 @@
-"""Zero-dependency Stdio JSON-RPC 2.0 MCP server for Convo Mesh."""
+"""Zero-dependency Stdio JSON-RPC 2.0 MCP server for Convo Mesh (Antigravity + Claude Code)."""
 
 from __future__ import annotations
 
@@ -17,12 +17,13 @@ from core import db
 TOOLS_SCHEMA: list[dict[str, Any]] = [
     {
         "name": "register_convo",
-        "description": "Register or update this conversation's alias, workspace, current goal, and status in the global Convo Mesh registry.",
+        "description": "Register or update this conversation's alias, client ('antigravity' or 'claude-code'), workspace, current goal, and status in the global Convo Mesh registry.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "conversation_id": {"type": "string", "description": "Your Conversation ID from <user_information>."},
+                "conversation_id": {"type": "string", "description": "Your Conversation ID (or Claude Code session_id)."},
                 "alias": {"type": "string", "description": "Short memorable name (e.g. 'learning', 'thrivo-api', 'buildbox')."},
+                "client": {"type": "string", "description": "Agent client host (e.g. 'antigravity', 'claude-code')."},
                 "workspace_path": {"type": "string", "description": "Primary workspace folder path."},
                 "current_goal": {"type": "string", "description": "What this conversation is currently working on."},
                 "status": {"type": "string", "enum": ["active", "paused", "completed"], "description": "Conversation status."},
@@ -32,19 +33,20 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
     },
     {
         "name": "list_convos",
-        "description": "List active conversations across all Antigravity workspaces, including their aliases, goals, and last turn timestamps.",
+        "description": "List active conversations across all Antigravity and Claude Code workspaces, including their aliases, client hosts, goals, and last turn timestamps.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "hours_back": {"type": "number", "description": "Lookback window in hours (default 24)."},
                 "status": {"type": "string", "description": "Optional status filter (e.g. 'active')."},
                 "workspace": {"type": "string", "description": "Optional workspace path substring filter."},
+                "client": {"type": "string", "description": "Optional client filter (e.g. 'antigravity' or 'claude-code')."},
             },
         },
     },
     {
         "name": "set_focus_lock",
-        "description": "Activate a cross-conversation focus lock. Other conversations will remind the user (soft) or refuse off-topic derailments (strict).",
+        "description": "Activate a cross-conversation & cross-agent focus lock. Other Antigravity and Claude Code sessions will remind the user (soft) or refuse off-topic derailments (strict).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -96,13 +98,20 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
     },
     {
         "name": "send_message",
-        "description": "Send a message from this conversation to a specific convo ID, alias, workspace, or broadcast to all conversations.",
+        "description": "Send a message from this conversation to a specific convo ID, alias, workspace, agent client ('claude-code' or 'antigravity'), or broadcast to all conversations.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "sender_convo_id": {"type": "string", "description": "Sending Conversation ID."},
-                "target_type": {"type": "string", "enum": ["convo", "alias", "workspace", "broadcast"], "description": "How to address recipients."},
-                "target_value": {"type": "string", "description": "Target convo ID, alias name, workspace path, or '*' for broadcast."},
+                "target_type": {
+                    "type": "string",
+                    "enum": ["convo", "alias", "workspace", "client", "broadcast"],
+                    "description": "How to address recipients ('client' targets 'claude-code' or 'antigravity').",
+                },
+                "target_value": {
+                    "type": "string",
+                    "description": "Target convo ID, alias name, workspace path, client name ('claude-code'/'antigravity'), or '*' for broadcast.",
+                },
                 "body": {"type": "string", "description": "Message content."},
                 "priority": {"type": "string", "enum": ["info", "normal", "reminder", "urgent"], "description": "Message priority (default 'normal')."},
                 "subject": {"type": "string", "description": "Optional short subject line."},
@@ -114,7 +123,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
     },
     {
         "name": "read_inbox",
-        "description": "Read messages addressed to this conversation (direct, by alias, by workspace, or broadcast).",
+        "description": "Read messages addressed to this conversation (direct, by alias, by workspace, by client, or broadcast).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -141,7 +150,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
     },
     {
         "name": "blackboard_set",
-        "description": "Store a shared JSON key-value fact or decision accessible across every Antigravity conversation.",
+        "description": "Store a shared JSON key-value fact or decision accessible across every Antigravity and Claude Code conversation.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -179,7 +188,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
     },
     {
         "name": "create_handoff",
-        "description": "Create a structured handoff packet so the next conversation (or a specific alias/workspace) automatically picks up your summary, next steps, and key files.",
+        "description": "Create a structured handoff packet so the next conversation (or a specific alias, workspace, or client like 'claude-code') automatically picks up your summary, next steps, and key files.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -187,15 +196,19 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "summary": {"type": "string", "description": "Concise summary of current state and decisions made."},
                 "next_steps": {"type": "array", "items": {"type": "string"}, "description": "Ordered next actions."},
                 "key_files": {"type": "array", "items": {"type": "string"}, "description": "Relevant file paths."},
-                "target_type": {"type": "string", "enum": ["next_any", "convo", "alias", "workspace"], "description": "Who should claim this handoff (default 'next_any')."},
-                "target_value": {"type": "string", "description": "Target convo ID, alias, workspace path, or '*' for next_any."},
+                "target_type": {
+                    "type": "string",
+                    "enum": ["next_any", "convo", "alias", "workspace", "client"],
+                    "description": "Who should claim this handoff (default 'next_any'; use 'client' to target 'claude-code' or 'antigravity').",
+                },
+                "target_value": {"type": "string", "description": "Target convo ID, alias, workspace path, client name, or '*' for next_any."},
             },
             "required": ["summary"],
         },
     },
     {
         "name": "get_workspace_activity",
-        "description": "Inspect recent file writes/edits across conversations to check for parallel edits or collisions.",
+        "description": "Inspect recent file writes/edits across Antigravity and Claude Code conversations to check for parallel edits or collisions.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -215,12 +228,14 @@ def _call_tool(name: str, args: dict[str, Any]) -> Any:
             alias=args.get("alias"),
             goal=args.get("current_goal"),
             status=args.get("status"),
+            client=args.get("client"),
         )
     if name == "list_convos":
         return db.list_conversations(
             hours_back=float(args.get("hours_back", 24.0)),
             status=args.get("status"),
             workspace=args.get("workspace"),
+            client=args.get("client"),
         )
     if name == "set_focus_lock":
         owner = db.resolve_convo_id(args.get("owner_convo_id"))
@@ -342,7 +357,7 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                 },
                 "serverInfo": {
                     "name": "convo-mesh",
-                    "version": "1.0.0",
+                    "version": "1.1.0",
                 },
             },
         )
