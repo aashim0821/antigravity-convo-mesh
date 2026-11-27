@@ -596,6 +596,61 @@ class ConvoMeshTestCase(unittest.TestCase):
         self.assertEqual(convos[0]["conversation_id"], "legacy-1")
         self.assertEqual(convos[0]["client"], "antigravity")
 
+    def test_12_utf8_arabic_emoji_and_lone_surrogate(self) -> None:
+        text = "العربية 🚀"
+        dirty = text + " \udc9d"
+        clean = text + " ?"
+
+        # db.py: every string parameter (and JSON column) tolerates a lone surrogate
+        row = db.upsert_conversation("utf8-db", workspace_path="/ws/utf8", last_user_input=dirty)
+        self.assertEqual(row["last_user_input"], clean)
+        msg = db.send_message("utf8-db", "broadcast", "*", body=dirty, subject=dirty)
+        self.assertEqual((msg["body"], msg["subject"]), (clean, clean))
+        self.assertEqual(db.blackboard_set("k", {"v": [dirty]})["value"], {"v": [clean]})
+        handoff = db.create_handoff("utf8-db", summary=dirty, next_steps=[dirty], key_files=[dirty])
+        self.assertEqual((handoff["summary"], handoff["next_steps"], handoff["key_files"]), (clean, [clean], [clean]))
+        lock = db.set_focus_lock("utf8-db", goal=dirty, allowed_workspaces=[dirty])
+        self.assertEqual((lock["goal"], lock["allowed_workspaces"]), (clean, [clean]))
+
+        # mesh_hook.py and mcp/server.py: raw UTF-8 bytes over pipes that default to cp1252
+        env = os.environ.copy()
+        env.pop("PYTHONUTF8", None)
+        env["PYTHONIOENCODING"] = "cp1252"
+
+        def run(script: str, payload: str) -> str:
+            proc = subprocess.run(
+                [PYTHON_EXE, "-X", "utf8=0", str(PLUGIN_ROOT / script)],
+                input=payload.encode("utf-8"),
+                capture_output=True,
+                cwd=str(PLUGIN_ROOT),
+                env=env,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            return proc.stdout.decode("utf-8")
+
+        # "\udc9d" travels as a JSON escape, exactly how a host would serialize it
+        prompt = json.dumps(text, ensure_ascii=False)[:-1] + ' \\udc9d"'
+        out = run(
+            "hooks/mesh_hook.py",
+            '{"hook_event_name": "UserPromptSubmit", "session_id": "utf8-hook", '
+            f'"cwd": "/ws/utf8", "prompt": {prompt}}}',
+        )
+        context = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(clean, context)
+        stored = {c["conversation_id"]: c for c in db.list_conversations()}
+        self.assertEqual(stored["utf8-hook"]["last_user_input"], clean)
+
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "blackboard_set", "arguments": {"key": "mcp", "value": text}},
+        }
+        resp = json.loads(run("mcp/server.py", json.dumps(request, ensure_ascii=False) + "\n"))
+        self.assertFalse(resp["result"]["isError"], msg=resp)
+        self.assertEqual(db.blackboard_get("mcp")["value"], text)
+
 
 if __name__ == "__main__":
     unittest.main()

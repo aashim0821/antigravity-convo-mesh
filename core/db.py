@@ -281,10 +281,19 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_v1_to_v1_1(conn)
 
 
+class _Utf8Connection(sqlite3.Connection):
+    """Replace lone UTF-16 surrogates in string parameters, which SQLite cannot encode."""
+
+    # shortcut: covers execute() with positional params only, extend if executemany or named params are added
+    def execute(self, sql: str, parameters: Any = ()) -> sqlite3.Cursor:
+        safe = [p.encode("utf-8", "replace").decode("utf-8") if isinstance(p, str) else p for p in parameters]
+        return super().execute(sql, safe)
+
+
 def connect() -> sqlite3.Connection:
     """Open a WAL-mode SQLite connection and ensure schema initialization."""
     db_path = get_db_path()
-    conn = sqlite3.connect(str(db_path), timeout=2.0, isolation_level=None)
+    conn = sqlite3.connect(str(db_path), timeout=2.0, isolation_level=None, factory=_Utf8Connection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=2000;")
     conn.execute("PRAGMA foreign_keys=ON;")
@@ -565,7 +574,7 @@ def set_focus_lock(
                 owner_ws,
                 clean_goal,
                 clean_mode,
-                json.dumps(allowed_list),
+                json.dumps(allowed_list, ensure_ascii=False),
                 (reason or "").strip(),
                 expires_at,
                 now,
@@ -995,7 +1004,8 @@ def blackboard_set(
     now = utc_now_iso()
     expires_at = utc_offset_iso(ttl_minutes) if (ttl_minutes and ttl_minutes > 0) else None
     clean_author = author_convo_id.strip() if author_convo_id else ""
-    value_json = json.dumps(value)
+    # ensure_ascii=False keeps surrogates literal so _Utf8Connection can replace them
+    value_json = json.dumps(value, ensure_ascii=False)
 
     conn = connect()
     try:
@@ -1295,8 +1305,8 @@ def create_handoff(
                 clean_type,
                 clean_target,
                 clean_summary,
-                json.dumps(steps_list),
-                json.dumps(files_list),
+                json.dumps(steps_list, ensure_ascii=False),
+                json.dumps(files_list, ensure_ascii=False),
                 now,
             ),
         )

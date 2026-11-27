@@ -434,6 +434,9 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def main() -> int:
+    # MCP stdio is UTF-8; Windows pipes would otherwise use the ANSI code page (cp1252).
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     for line in sys.stdin:
         stripped = line.strip()
         if not stripped:

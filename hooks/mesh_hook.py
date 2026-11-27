@@ -330,6 +330,9 @@ def handle_event(payload: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     try:
+        # Hosts send UTF-8; Windows pipes would otherwise decode with the ANSI code page (cp1252).
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw and raw.strip() else {}
         if not isinstance(payload, dict):
