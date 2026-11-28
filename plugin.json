@@ -1,7 +1,7 @@
 {
   "name": "convo-mesh",
   "displayName": "Convo Mesh",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Cross-conversation & cross-agent (Antigravity <-> Claude Code) coordination: automatic soft/strict focus locks, direct/alias/workspace/client/broadcast messaging, shared blackboard, file collision warnings, and automatic quota-failover continuity.",
   "author": {
     "name": "Aashim",

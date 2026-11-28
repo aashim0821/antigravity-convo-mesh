@@ -50,6 +50,16 @@ Use `blackboard_set`, `blackboard_get`, and `blackboard_delete` to store structu
 - **`[CONVO-MESH WORKSPACE CONTINUITY]` / `[CONVO-MESH HANDOFF]`**: Pick up seamlessly from the previous session's state without asking the user to repeat context.
 - **`[CONVO-MESH COLLISION WARNING]`**: Warn the user before editing files recently modified by another conversation (`get_workspace_activity` shows recent file touches).
 
+### 6. Autonomous Peer Relay (`Mode B` — Zero-Token Side-by-Side Execution)
+To run an autonomous back-and-forth build/QA loop between **Antigravity** and **Claude Code** without human copy-pasting or polling tokens:
+1. **Start:** Coordinator calls `start_relay_task` (`goal`, optional `repo_path` which creates an isolated Git worktree at `<repo>/.worktrees/<slug>` on branch `relay/<slug>`, `assign_to_client`, and `max_hops=4`).
+2. **Execute Inside Worktree:** When `worktree_path` is set on the relay task, perform all edits and tests strictly inside `worktree_path` so the main working tree never collides.
+3. **Pass the Baton:** Call `relay_submit_turn` (`task_id`, `summary`, `next_status`: `"review"` after coding, `"changes_requested"` if QA fails, or `"done"` when verified complete; pass `actor_client`: `"claude-code"` or `"antigravity"`). SQLite hard-halts into `halted_hop_limit` at `max_hops` so infinite loops are impossible.
+4. **Zero-Token Sleep & Reactive Wakeup:** Whenever the task remains active (not `done`, `halted_hop_limit`, or `paused`) and `active_turn_client` is now the peer, launch the zero-token blocking watcher in the background and end your turn:
+   - **Claude Code (`Auto` mode):** `Bash` with `run_in_background: true`: `python3 "<convo-mesh-dir>/cli.py" watch --client claude-code --task-id <task_id> --timeout 1800`
+   - **Antigravity:** async `run_command` (`WaitMsBeforeAsync: 500`): `python3 "<convo-mesh-dir>/cli.py" watch --client antigravity --task-id <task_id> --timeout 1800`
+   When the peer calls `relay_submit_turn`, `watch` exits `0` with the updated JSON task and wakes you automatically!
+
 ## Fallback Without Full Plugin Installation
 If the `convo-mesh` MCP server is not enabled in the current environment, use `cli.py` (requires Python 3.10+):
 - `python cli.py status`

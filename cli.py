@@ -15,7 +15,8 @@ from core import db
 
 
 def _print_json(data: object) -> None:
-    print(json.dumps(data, indent=2))
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def cmd_status(_args: argparse.Namespace) -> int:
@@ -97,6 +98,67 @@ def cmd_reset_db(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watch(args: argparse.Namespace) -> int:
+    res = db.watch_for_wakeup(
+        client=args.client,
+        convo_id=args.convo_id or "",
+        task_id=args.task_id,
+        timeout_seconds=args.timeout,
+        poll_interval=args.interval,
+    )
+    _print_json(res)
+    return 0
+
+
+def cmd_relay_start(args: argparse.Namespace) -> int:
+    task = db.start_relay_task(
+        goal=args.goal,
+        slug=args.slug,
+        repo_path=args.repo or "",
+        initiator_convo_id="cli",
+        assign_to_client=args.to,
+        max_hops=args.max_hops,
+        initial_brief=args.brief or "",
+    )
+    _print_json(task)
+    return 0
+
+
+def cmd_relay_turn(args: argparse.Namespace) -> int:
+    task = db.relay_submit_turn(
+        task_id=args.task_id,
+        summary=args.summary,
+        next_status=args.status,
+        actor_convo_id="cli",
+        actor_client=args.actor_client or "",
+    )
+    _print_json(task)
+    return 0
+
+
+def cmd_relay_list(args: argparse.Namespace) -> int:
+    tasks = db.list_relay_tasks(task_id=args.task_id, status=args.status)
+    _print_json(tasks)
+    return 0
+
+
+def cmd_pause(args: argparse.Namespace) -> int:
+    paused = db.pause_relay_tasks(task_id=args.task_id)
+    _print_json({"paused_count": len(paused), "tasks": paused})
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    task = db.resume_relay_task(
+        task_id=args.task_id,
+        assign_to_client=args.to,
+        add_hops=args.add_hops,
+        note=args.note,
+    )
+    _print_json(task)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="convo-mesh", description="Convo Mesh CLI")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -137,6 +199,46 @@ def build_parser() -> argparse.ArgumentParser:
     p_reset = sub.add_parser("reset-db", help="Reset the Convo Mesh SQLite database")
     p_reset.add_argument("--yes", action="store_true", help="Confirm destructive reset")
     p_reset.set_defaults(func=cmd_reset_db)
+
+    p_watch = sub.add_parser("watch", help="Block at 0 LLM tokens until a relay turn or unread message arrives")
+    p_watch.add_argument("--client", required=True, choices=["antigravity", "claude-code"], help="Waiting agent client")
+    p_watch.add_argument("--convo-id", dest="convo_id", default="", help="Optional conversation/session ID for inbox messages")
+    p_watch.add_argument("--task-id", dest="task_id", default=None, help="Optional specific relay task_id to watch")
+    p_watch.add_argument("--timeout", type=float, default=1800.0, help="Timeout in seconds (default 1800)")
+    p_watch.add_argument("--interval", type=float, default=0.5, help="SQLite poll interval in seconds (default 0.5)")
+    p_watch.set_defaults(func=cmd_watch)
+
+    p_rstart = sub.add_parser("relay-start", help="Start a bounded autonomous relay task")
+    p_rstart.add_argument("--goal", required=True)
+    p_rstart.add_argument("--slug", default=None)
+    p_rstart.add_argument("--repo", default="")
+    p_rstart.add_argument("--to", default="claude-code", choices=["claude-code", "antigravity"])
+    p_rstart.add_argument("--max-hops", dest="max_hops", type=int, default=4)
+    p_rstart.add_argument("--brief", default="")
+    p_rstart.set_defaults(func=cmd_relay_start)
+
+    p_rturn = sub.add_parser("relay-turn", help="Submit a turn on a relay task")
+    p_rturn.add_argument("--task-id", dest="task_id", required=True)
+    p_rturn.add_argument("--summary", required=True)
+    p_rturn.add_argument("--status", default="review", choices=["in_progress", "review", "changes_requested", "done", "paused"])
+    p_rturn.add_argument("--actor-client", dest="actor_client", default="")
+    p_rturn.set_defaults(func=cmd_relay_turn)
+
+    p_rlist = sub.add_parser("relay-list", help="List relay tasks")
+    p_rlist.add_argument("--task-id", dest="task_id", default=None)
+    p_rlist.add_argument("--status", default=None)
+    p_rlist.set_defaults(func=cmd_relay_list)
+
+    p_pause = sub.add_parser("pause", help="Pause one or all active relay tasks immediately")
+    p_pause.add_argument("--task-id", dest="task_id", default=None)
+    p_pause.set_defaults(func=cmd_pause)
+
+    p_resume = sub.add_parser("resume", help="Resume a paused or hop-halted relay task")
+    p_resume.add_argument("--task-id", dest="task_id", required=True)
+    p_resume.add_argument("--to", required=True, choices=["claude-code", "antigravity"])
+    p_resume.add_argument("--add-hops", dest="add_hops", type=int, default=2)
+    p_resume.add_argument("--note", default="Resumed via CLI")
+    p_resume.set_defaults(func=cmd_resume)
 
     return parser
 

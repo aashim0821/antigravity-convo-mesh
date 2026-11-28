@@ -402,7 +402,7 @@ class ConvoMeshTestCase(unittest.TestCase):
         self.assertEqual(by_id[1]["result"]["serverInfo"]["name"], "convo-mesh")
 
         tools = by_id[2]["result"]["tools"]
-        self.assertEqual(len(tools), 14)
+        self.assertEqual(len(tools), 18)
 
         for call_id in (3, 4, 5, 6, 7, 8):
             self.assertFalse(by_id[call_id]["result"]["isError"], msg=f"Call {call_id} failed: {by_id[call_id]}")
@@ -650,6 +650,118 @@ class ConvoMeshTestCase(unittest.TestCase):
         resp = json.loads(run("mcp/server.py", json.dumps(request, ensure_ascii=False) + "\n"))
         self.assertFalse(resp["result"]["isError"], msg=resp)
         self.assertEqual(db.blackboard_get("mcp")["value"], text)
+
+    def test_13_relay_git_worktree_and_hard_hop_limit(self) -> None:
+        import shutil
+        import tempfile
+
+        repo_dir = Path(tempfile.mkdtemp(prefix="convo_mesh_git_"))
+        try:
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True, capture_output=True)
+            (repo_dir / "README.md").write_text("# Demo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=str(repo_dir), check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+
+            # Start relay task with max_hops=4 -> creates <repo>/.worktrees/auth-fix on relay/auth-fix
+            t0 = db.start_relay_task(
+                goal="Implement auth check",
+                slug="auth-fix",
+                repo_path=str(repo_dir),
+                initiator_convo_id="agy-1",
+                assign_to_client="claude-code",
+                max_hops=4,
+            )
+            tid = t0["task_id"]
+            wt = Path(t0["worktree_path"])
+            self.assertTrue(wt.exists())
+            self.assertEqual(t0["branch_name"], "relay/auth-fix")
+            self.assertEqual(t0["active_turn_client"], "claude-code")
+            self.assertEqual(t0["hop_count"], 0)
+
+            # Main repo git status must stay clean thanks to .git/info/exclude
+            st = subprocess.run(["git", "status", "--porcelain"], cwd=str(repo_dir), check=True, capture_output=True, text=True)
+            self.assertEqual(st.stdout.strip(), "")
+
+            # Hop 1 (Claude -> Antigravity)
+            t1 = db.relay_submit_turn(tid, "Implemented auth.py", next_status="review", actor_client="claude-code")
+            self.assertEqual((t1["hop_count"], t1["active_turn_client"], t1["status"]), (1, "antigravity", "review"))
+
+            # Hop 2 (Antigravity -> Claude)
+            t2 = db.relay_submit_turn(tid, "Edge case on empty token", next_status="changes_requested", actor_client="antigravity")
+            self.assertEqual((t2["hop_count"], t2["active_turn_client"], t2["status"]), (2, "claude-code", "changes_requested"))
+
+            # Hop 3 (Claude -> Antigravity)
+            t3 = db.relay_submit_turn(tid, "Fixed empty token", next_status="review", actor_client="claude-code")
+            self.assertEqual((t3["hop_count"], t3["active_turn_client"], t3["status"]), (3, "antigravity", "review"))
+
+            # Hop 4 -> hits max_hops=4! SQLite circuit-breaker MUST halt to human
+            t4 = db.relay_submit_turn(tid, "Still one lint warning", next_status="changes_requested", actor_client="antigravity")
+            self.assertEqual((t4["hop_count"], t4["active_turn_client"], t4["status"]), (4, "human", "halted_hop_limit"))
+
+            # Any 5th autonomous turn must be rejected
+            with self.assertRaises(ValueError):
+                db.relay_submit_turn(tid, "Try sneaking past cap", next_status="review", actor_client="claude-code")
+
+            # Dirty worktree cleanup must refuse until clean
+            (wt / "untracked.txt").write_text("dirty", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                db.cleanup_relay_worktree(tid)
+            (wt / "untracked.txt").unlink()
+            cleaned = db.cleanup_relay_worktree(tid, delete_branch=True)
+            self.assertTrue(cleaned["removed"])
+            self.assertFalse(wt.exists())
+        finally:
+            shutil.rmtree(repo_dir, ignore_errors=True)
+
+    def test_14_blocking_cli_watch_zero_race_wakeup(self) -> None:
+        import time
+
+        # Start task assigned to antigravity first, so claude-code watcher must block
+        t0 = db.start_relay_task(
+            goal="Ping pong test",
+            slug="ping-pong",
+            assign_to_client="antigravity",
+            max_hops=4,
+        )
+        tid = t0["task_id"]
+
+        env = os.environ.copy()
+        env["CONVO_MESH_DB"] = str(self.db_path)
+        watcher = subprocess.Popen(
+            [
+                PYTHON_EXE,
+                str(PLUGIN_ROOT / "cli.py"),
+                "watch",
+                "--client",
+                "claude-code",
+                "--task-id",
+                tid,
+                "--timeout",
+                "5",
+                "--interval",
+                "0.1",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=str(PLUGIN_ROOT),
+            env=env,
+        )
+        try:
+            time.sleep(0.25)
+            self.assertIsNone(watcher.poll(), "Watcher exited prematurely before its turn")
+            db.relay_submit_turn(tid, "Handing turn to Claude — مرحبا", next_status="changes_requested", actor_client="antigravity")
+            out_bytes, err_bytes = watcher.communicate(timeout=3.0)
+            self.assertEqual(watcher.returncode, 0, msg=err_bytes)
+            payload = json.loads(out_bytes.decode("utf-8"))
+            self.assertEqual(payload["woke_on"], "relay_turn")
+            self.assertEqual(payload["relay_task"]["task_id"], tid)
+            self.assertEqual(payload["relay_task"]["active_turn_client"], "claude-code")
+            self.assertIn("مرحبا", payload["relay_task"]["last_summary"])
+        finally:
+            if watcher.poll() is None:
+                watcher.kill()
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "convo-mesh",
-      "description": "Soft/strict focus locks, cross-agent messaging, shared blackboard, file collision warnings, and automatic quota-failover workspace continuity.",
+      "description": "Autonomous Antigravity <-> Claude Code peer relay (0-token watcher, isolated Git worktrees, SQLite hop cap), focus locks, messaging, shared blackboard, collision warnings, and quota-failover continuity.",
       "source": "./",
       "category": "productivity"
     }

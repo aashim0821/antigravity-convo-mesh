@@ -1,6 +1,6 @@
 {
   "name": "convo-mesh",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Cross-conversation & cross-agent (Antigravity <-> Claude Code) coordination bus: soft/strict focus locks, cross-agent messaging, shared blackboard, file collision guard, and automatic quota-failover workspace continuity.",
   "author": {
     "name": "Aashim",

@@ -13,6 +13,7 @@ Separate chats — and separate AI coding agents — normally live in isolated w
 
 ## What It Solves
 
+- **Autonomous Peer Relay (`v1.2`):** Run **Google Antigravity** and **Claude Code (`Auto` mode)** side-by-side hands-free! `start_relay_task` provisions an isolated Git worktree (`<repo>/.worktrees/<slug>` on branch `relay/<slug>`, auto-excluded via `.git/info/exclude`), `cli.py watch` sleeps in the background at **0 LLM tokens** and wakes each agent automatically on turn handoff (`<task-notification>` in Claude Code, Reactive Wakeup in Antigravity), and SQLite enforces a hard `max_hops` circuit-breaker (default `4`) so infinite loops are impossible.
 - **Live Antigravity ↔ Claude Code Bridge (`target_type: "client"`):** Tell Antigravity *"Send a message to Claude Code to run the integration tests"*, switch to Claude Code, and Claude receives it automatically on your next prompt (and vice versa).
 - **Automatic Quota-Failover Continuity:** Every turn automatically checkpoints your workspace, goal, last prompt, and modified files. If Antigravity hits a quota wall mid-task and you open Claude Code in the same folder (or switch the other way), `SessionStart` injects `[CONVO-MESH WORKSPACE CONTINUITY]` so the new agent picks up right where you left off with **zero manual copy-pasting**.
 - **Focus Guard (`soft` & `strict` locks):** Studying in Chat A and drift into another Antigravity or Claude Code chat? Chat B automatically receives a reminder at the start of the turn — or blocks off-topic execution completely in `strict` mode until you unlock or snooze.
@@ -103,6 +104,10 @@ Both installations automatically connect to the **exact same local SQLite databa
 | `blackboard_delete` | Delete a key from the shared blackboard |
 | `create_handoff` | Publish a structured summary, `next_steps`, and `key_files` for the next chat or specific `client` |
 | `get_workspace_activity` | Inspect recent file edits across Antigravity and Claude Code for collision awareness |
+| `start_relay_task` | Start a bounded autonomous peer-relay task (`max_hops=4`) with an optional isolated Git worktree |
+| `relay_submit_turn` | Submit completed work/QA on a relay task and flip `active_turn_client` to the peer (or mark `done`) |
+| `list_relay_tasks` | Inspect relay task state, worktree path, `hop_count/max_hops`, and turn history |
+| `control_relay` | Instant `pause` kill-switch, human `resume` (with extra hops), or safe `cleanup_worktree` |
 
 **MCP Resources:**
 - `convo-mesh://status` — Live snapshot of active conversations, locks, message counts, and blackboard entries.
@@ -118,6 +123,9 @@ python cli.py focus --goal "Finish API refactor" --mode strict --minutes 45
 python cli.py clear-focus
 python cli.py send --type client --to claude-code --body "Continue tests from Antigravity"
 python cli.py blackboard --ns api --key base_url --set-json '"http://localhost:8000"'
+python cli.py relay-start --goal "Implement webhook signature check" --slug webhook-sig --repo . --to claude-code --max-hops 4
+python cli.py watch --client antigravity --task-id <task_id> --timeout 1800
+python cli.py pause
 python cli.py reset-db --yes
 ```
 

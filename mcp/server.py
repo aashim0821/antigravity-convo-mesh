@@ -22,7 +22,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "conversation_id": {"type": "string", "description": "Your Conversation ID (or Claude Code session_id)."},
-                "alias": {"type": "string", "description": "Short memorable name (e.g. 'learning', 'thrivo-api', 'buildbox')."},
+                "alias": {"type": "string", "description": "Short memorable name (e.g. 'learning', 'backend-api', 'frontend')."},
                 "client": {"type": "string", "description": "Agent client host (e.g. 'antigravity', 'claude-code')."},
                 "workspace_path": {"type": "string", "description": "Primary workspace folder path."},
                 "current_goal": {"type": "string", "description": "What this conversation is currently working on."},
@@ -156,7 +156,7 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
             "properties": {
                 "key": {"type": "string", "description": "Blackboard key name."},
                 "value": {"description": "Any JSON-serializable value (string, number, boolean, array, object)."},
-                "namespace": {"type": "string", "description": "Namespace such as 'global', 'thrivo', or 'study' (default 'global')."},
+                "namespace": {"type": "string", "description": "Namespace such as 'global', 'api', or 'study' (default 'global')."},
                 "author_convo_id": {"type": "string", "description": "Author Conversation ID."},
                 "ttl_minutes": {"type": "number", "description": "Optional expiry in minutes."},
             },
@@ -215,6 +215,92 @@ TOOLS_SCHEMA: list[dict[str, Any]] = [
                 "workspace": {"type": "string", "description": "Optional workspace path filter."},
                 "minutes_back": {"type": "number", "description": "Lookback window in minutes (default 30)."},
             },
+        },
+    },
+    {
+        "name": "start_relay_task",
+        "description": "Start a bounded autonomous peer-relay task between Antigravity and Claude Code with SQLite hop-cap protection (default max_hops=4) and an optional isolated Git worktree (<repo>/.worktrees/<slug> on branch relay/<slug>).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "goal": {"type": "string", "description": "Clear task objective and acceptance criteria."},
+                "slug": {"type": "string", "description": "Optional short kebab-case slug for the worktree/branch."},
+                "repo_path": {"type": "string", "description": "Optional git repository path to create an isolated worktree in."},
+                "initiator_convo_id": {"type": "string", "description": "Initiating Conversation ID."},
+                "assign_to_client": {
+                    "type": "string",
+                    "enum": ["claude-code", "antigravity"],
+                    "description": "Which agent takes the first turn (default 'claude-code').",
+                },
+                "max_hops": {"type": "integer", "description": "Hard autonomous turn limit before auto-halting for human review (default 4, max 12)."},
+                "initial_brief": {"type": "string", "description": "Optional detailed handoff brief for hop 0."},
+            },
+            "required": ["goal"],
+        },
+    },
+    {
+        "name": "relay_submit_turn",
+        "description": "Submit your completed turn on a relay task and pass the baton to the peer agent (or mark 'done'). SQLite automatically halts at max_hops to prevent infinite loops.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Relay task ID (e.g. 'relay-...')."},
+                "summary": {"type": "string", "description": "Concise summary of changes made, test/QA results, and what the peer should do next."},
+                "next_status": {
+                    "type": "string",
+                    "enum": ["in_progress", "review", "changes_requested", "done", "paused"],
+                    "description": "Next task state ('review' after coding, 'changes_requested' if QA fails, 'done' when verified complete).",
+                },
+                "next_client": {
+                    "type": "string",
+                    "enum": ["claude-code", "antigravity"],
+                    "description": "Optional explicit next client (defaults to the opposite peer).",
+                },
+                "actor_convo_id": {"type": "string", "description": "Your Conversation/Session ID."},
+                "actor_client": {
+                    "type": "string",
+                    "enum": ["claude-code", "antigravity"],
+                    "description": "Your client identity ('claude-code' or 'antigravity').",
+                },
+            },
+            "required": ["task_id", "summary"],
+        },
+    },
+    {
+        "name": "list_relay_tasks",
+        "description": "Inspect one or more autonomous peer-relay tasks, including worktree path, hop_count/max_hops, active_turn_client, and turn history.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "string", "description": "Optional exact relay task_id."},
+                "status": {"type": "string", "description": "Optional status filter."},
+                "active_turn_client": {"type": "string", "description": "Optional filter ('claude-code', 'antigravity', 'human')."},
+                "limit": {"type": "integer", "description": "Max tasks to return (default 20)."},
+            },
+        },
+    },
+    {
+        "name": "control_relay",
+        "description": "Pause active relay tasks (kill-switch), resume a paused/halted task with extra hops, or clean up a clean relay Git worktree.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["pause", "resume", "cleanup_worktree"],
+                    "description": "Control operation to perform.",
+                },
+                "task_id": {"type": "string", "description": "Target relay task_id (optional for 'pause' to pause all active tasks)."},
+                "assign_to_client": {
+                    "type": "string",
+                    "enum": ["claude-code", "antigravity"],
+                    "description": "Target agent when action='resume'.",
+                },
+                "add_hops": {"type": "integer", "description": "Additional hops to grant when action='resume' (default 2)."},
+                "note": {"type": "string", "description": "Optional note recorded on resume."},
+                "delete_branch": {"type": "boolean", "description": "Also delete merged branch when action='cleanup_worktree' (default false)."},
+            },
+            "required": ["action"],
         },
     },
 ]
@@ -323,6 +409,53 @@ def _call_tool(name: str, args: dict[str, Any]) -> Any:
             workspace=args.get("workspace"),
             minutes_back=float(args.get("minutes_back", 30.0)),
         )
+    if name == "start_relay_task":
+        return db.start_relay_task(
+            goal=args["goal"],
+            slug=args.get("slug"),
+            repo_path=args.get("repo_path") or "",
+            initiator_convo_id=args.get("initiator_convo_id") or "",
+            assign_to_client=args.get("assign_to_client", "claude-code"),
+            max_hops=int(args.get("max_hops", 4)),
+            initial_brief=args.get("initial_brief") or "",
+        )
+    if name == "relay_submit_turn":
+        return db.relay_submit_turn(
+            task_id=args["task_id"],
+            summary=args["summary"],
+            next_status=args.get("next_status", "review"),
+            next_client=args.get("next_client"),
+            actor_convo_id=args.get("actor_convo_id") or "",
+            actor_client=args.get("actor_client") or "",
+        )
+    if name == "list_relay_tasks":
+        return db.list_relay_tasks(
+            task_id=args.get("task_id"),
+            status=args.get("status"),
+            active_turn_client=args.get("active_turn_client"),
+            limit=int(args.get("limit", 20)),
+        )
+    if name == "control_relay":
+        act = args["action"]
+        if act == "pause":
+            return {"paused_tasks": db.pause_relay_tasks(task_id=args.get("task_id"))}
+        if act == "resume":
+            if not args.get("task_id") or not args.get("assign_to_client"):
+                raise ValueError("task_id and assign_to_client are required for action='resume'")
+            return db.resume_relay_task(
+                task_id=args["task_id"],
+                assign_to_client=args["assign_to_client"],
+                add_hops=int(args.get("add_hops", 2)),
+                note=args.get("note") or "Resumed by human",
+            )
+        if act == "cleanup_worktree":
+            if not args.get("task_id"):
+                raise ValueError("task_id is required for action='cleanup_worktree'")
+            return db.cleanup_relay_worktree(
+                task_id=args["task_id"],
+                delete_branch=bool(args.get("delete_branch", False)),
+            )
+        raise ValueError(f"Unsupported control_relay action: {act}")
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -357,7 +490,7 @@ def handle_request(req: dict[str, Any]) -> dict[str, Any] | None:
                 },
                 "serverInfo": {
                     "name": "convo-mesh",
-                    "version": "1.1.0",
+                    "version": "1.2.0",
                 },
             },
         )

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
+import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -276,6 +279,26 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
         CREATE INDEX IF NOT EXISTS idx_file_touches_ws ON file_touches(workspace_path, touched_at);
         CREATE INDEX IF NOT EXISTS idx_handoffs_claimed ON handoffs(claimed_by_convo_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS relay_tasks (
+            task_id TEXT PRIMARY KEY,
+            slug TEXT NOT NULL,
+            repo_path TEXT NOT NULL DEFAULT '',
+            worktree_path TEXT NOT NULL DEFAULT '',
+            branch_name TEXT NOT NULL DEFAULT '',
+            goal TEXT NOT NULL,
+            initiator_convo_id TEXT NOT NULL,
+            active_turn_client TEXT NOT NULL CHECK(active_turn_client IN ('antigravity', 'claude-code', 'human')),
+            status TEXT NOT NULL CHECK(status IN ('pending', 'in_progress', 'review', 'changes_requested', 'done', 'halted_hop_limit', 'paused')),
+            hop_count INTEGER NOT NULL DEFAULT 0,
+            max_hops INTEGER NOT NULL DEFAULT 4,
+            history_json TEXT NOT NULL DEFAULT '[]',
+            last_summary TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_relay_tasks_turn ON relay_tasks(active_turn_client, status, updated_at);
         """
     )
     _migrate_v1_to_v1_1(conn)
@@ -1399,6 +1422,9 @@ def get_mesh_status() -> dict[str, Any]:
             "SELECT COUNT(*) AS c FROM file_touches WHERE touched_at >= ?",
             (touch_cutoff,),
         ).fetchone()["c"]
+        relay_rows = conn.execute(
+            "SELECT * FROM relay_tasks WHERE status NOT IN ('done') ORDER BY updated_at DESC LIMIT 10"
+        ).fetchall()
         return {
             "db_path": str(db_path),
             "conversations_24h": len(active_convos),
@@ -1408,6 +1434,531 @@ def get_mesh_status() -> dict[str, Any]:
             "unclaimed_handoffs": unclaimed_handoffs,
             "blackboard_entries": bb_count,
             "recent_file_touches_30m": recent_touches,
+            "open_relay_tasks": [_format_relay_task(r) for r in relay_rows],
         }
     finally:
         conn.close()
+
+
+_SLUG_RE = re.compile(r"[^a-z0-9_-]+")
+_ACTIVE_RELAY_STATUSES = ("pending", "in_progress", "review", "changes_requested")
+_TERMINAL_OR_HALTED_STATUSES = ("done", "halted_hop_limit", "paused")
+
+
+def _sanitize_slug(raw: str) -> str:
+    base = _SLUG_RE.sub("-", (raw or "").strip().lower()).strip("-_")
+    return (base[:40] or "task").strip("-_") or "task"
+
+
+def _normalize_agent_client(client: str | None) -> str:
+    c = (client or "").strip().lower()
+    if c in ("claude", "claude-code", "claudecode"):
+        return "claude-code"
+    if c in ("agy", "antigravity"):
+        return "antigravity"
+    if c == "human":
+        return "human"
+    raise ValueError("client must be 'claude-code', 'antigravity', or 'human'")
+
+
+def _peer_of(client: str) -> str:
+    return "antigravity" if client == "claude-code" else "claude-code"
+
+
+def _format_relay_task(row: sqlite3.Row) -> dict[str, Any]:
+    data = dict(row)
+    raw_hist = data.pop("history_json", "[]")
+    try:
+        data["history"] = json.loads(raw_hist or "[]")
+    except json.JSONDecodeError:
+        data["history"] = []
+    return data
+
+
+def _ensure_git_exclude(repo_root: Path, pattern: str = ".worktrees/") -> None:
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        return
+    git_dir_raw = proc.stdout.strip()
+    git_dir = Path(git_dir_raw) if Path(git_dir_raw).is_absolute() else (repo_root / git_dir_raw).resolve()
+    info_dir = git_dir / "info"
+    info_dir.mkdir(parents=True, exist_ok=True)
+    exclude_file = info_dir / "exclude"
+    existing = exclude_file.read_text(encoding="utf-8", errors="replace") if exclude_file.exists() else ""
+    lines = [ln.strip() for ln in existing.splitlines()]
+    if pattern not in lines and pattern.rstrip("/") not in lines:
+        sep = "" if (not existing or existing.endswith("\n")) else "\n"
+        exclude_file.write_text(f"{existing}{sep}{pattern}\n", encoding="utf-8")
+
+
+def ensure_relay_worktree(repo_path: str, slug: str) -> tuple[str, str, str]:
+    """Create or reuse an isolated git worktree at <repo>/.worktrees/<slug> on branch relay/<slug>."""
+    raw_repo = Path(repo_path).expanduser().resolve()
+    if not raw_repo.exists():
+        raise ValueError(f"Repository path does not exist: {raw_repo}")
+
+    top = subprocess.run(
+        ["git", "-C", str(raw_repo), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if top.returncode != 0:
+        raise ValueError(f"Not a git repository: {raw_repo} ({top.stderr.strip()})")
+    repo_root = Path(top.stdout.strip()).resolve()
+
+    head = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--verify", "HEAD"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if head.returncode != 0:
+        raise ValueError(
+            f"Repository '{repo_root}' has no initial commit yet; commit once before creating a worktree (or omit repo_path)."
+        )
+
+    _ensure_git_exclude(repo_root, ".worktrees/")
+    clean_slug = _sanitize_slug(slug)
+    branch_name = f"relay/{clean_slug}"
+    wt_path = repo_root / ".worktrees" / clean_slug
+
+    if not wt_path.exists():
+        wt_path.parent.mkdir(parents=True, exist_ok=True)
+        add = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "add", "-B", branch_name, str(wt_path), "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if add.returncode != 0:
+            raise ValueError(f"Failed to create git worktree '{wt_path}': {add.stderr.strip()}")
+
+    return str(repo_root), str(wt_path), branch_name
+
+
+def start_relay_task(
+    goal: str,
+    slug: str | None = None,
+    repo_path: str = "",
+    initiator_convo_id: str = "",
+    assign_to_client: str = "claude-code",
+    max_hops: int = 4,
+    initial_brief: str = "",
+) -> dict[str, Any]:
+    """Create a bounded autonomous peer-relay task (with optional isolated git worktree)."""
+    clean_goal = (goal or "").strip()
+    if not clean_goal:
+        raise ValueError("goal must be non-empty")
+
+    target_client = _normalize_agent_client(assign_to_client)
+    if target_client == "human":
+        raise ValueError("assign_to_client must be 'claude-code' or 'antigravity'")
+
+    hops_cap = int(max_hops)
+    if hops_cap < 1 or hops_cap > 12:
+        raise ValueError("max_hops must be between 1 and 12")
+
+    clean_slug = _sanitize_slug(slug or clean_goal[:36])
+    stamp = datetime.now(timezone.utc).strftime("%H%M%S")
+    task_id = f"relay-{clean_slug}-{stamp}"
+
+    resolved_repo = ""
+    worktree_path = ""
+    branch_name = ""
+    if repo_path and repo_path.strip():
+        resolved_repo, worktree_path, branch_name = ensure_relay_worktree(repo_path.strip(), clean_slug)
+
+    initiator = resolve_convo_id(initiator_convo_id) if initiator_convo_id else "coordinator"
+    now = utc_now_iso()
+    summary_text = (initial_brief or clean_goal).strip()
+    history = [
+        {
+            "hop": 0,
+            "by_convo": initiator,
+            "assigned_to": target_client,
+            "status": "pending",
+            "summary": summary_text,
+            "at": now,
+        }
+    ]
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO relay_tasks (
+                task_id, slug, repo_path, worktree_path, branch_name, goal,
+                initiator_convo_id, active_turn_client, status, hop_count, max_hops,
+                history_json, last_summary, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                clean_slug,
+                resolved_repo,
+                worktree_path,
+                branch_name,
+                clean_goal,
+                initiator,
+                target_client,
+                hops_cap,
+                json.dumps(history, ensure_ascii=False),
+                summary_text,
+                now,
+                now,
+            ),
+        )
+        row = conn.execute("SELECT * FROM relay_tasks WHERE task_id = ?", (task_id,)).fetchone()
+        conn.execute("COMMIT")
+        return _format_relay_task(row)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def relay_submit_turn(
+    task_id: str,
+    summary: str,
+    next_status: str = "review",
+    next_client: str | None = None,
+    actor_convo_id: str = "",
+    actor_client: str = "",
+) -> dict[str, Any]:
+    """Submit a turn on an active relay task, enforcing the SQLite max_hops circuit-breaker."""
+    clean_tid = (task_id or "").strip()
+    clean_summary = (summary or "").strip()
+    if not clean_tid:
+        raise ValueError("task_id is required")
+    if not clean_summary:
+        raise ValueError("summary is required")
+
+    status_norm = (next_status or "review").strip().lower()
+    if status_norm not in ("in_progress", "review", "changes_requested", "done", "paused"):
+        raise ValueError("next_status must be one of: in_progress, review, changes_requested, done, paused")
+
+    now = utc_now_iso()
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM relay_tasks WHERE task_id = ?", (clean_tid,)).fetchone()
+        if row is None:
+            raise ValueError(f"Relay task not found: {clean_tid}")
+
+        cur_status = row["status"]
+        if cur_status in _TERMINAL_OR_HALTED_STATUSES:
+            raise ValueError(
+                f"Relay task '{clean_tid}' is '{cur_status}' and cannot auto-advance without human resume."
+            )
+
+        current_holder = row["active_turn_client"]
+        resolved_actor_client = (
+            _normalize_agent_client(actor_client)
+            if (actor_client and actor_client.strip())
+            else current_holder
+        )
+
+        try:
+            history = json.loads(row["history_json"] or "[]")
+        except json.JSONDecodeError:
+            history = []
+
+        if status_norm == "done":
+            new_hops = int(row["hop_count"]) + 1
+            final_status = "done"
+            final_turn = "human"
+        elif status_norm == "paused":
+            new_hops = int(row["hop_count"])
+            final_status = "paused"
+            final_turn = "human"
+        else:
+            new_hops = int(row["hop_count"]) + 1
+            max_hops = int(row["max_hops"])
+            if new_hops >= max_hops:
+                final_status = "halted_hop_limit"
+                final_turn = "human"
+            else:
+                final_status = status_norm
+                final_turn = (
+                    _normalize_agent_client(next_client)
+                    if (next_client and next_client.strip())
+                    else _peer_of(resolved_actor_client)
+                )
+
+        history.append(
+            {
+                "hop": new_hops,
+                "by_client": resolved_actor_client,
+                "by_convo": (actor_convo_id or "").strip(),
+                "assigned_to": final_turn,
+                "status": final_status,
+                "summary": clean_summary,
+                "at": now,
+            }
+        )
+
+        conn.execute(
+            """
+            UPDATE relay_tasks
+            SET active_turn_client = ?, status = ?, hop_count = ?,
+                history_json = ?, last_summary = ?, updated_at = ?
+            WHERE task_id = ?
+            """,
+            (
+                final_turn,
+                final_status,
+                new_hops,
+                json.dumps(history, ensure_ascii=False),
+                clean_summary,
+                now,
+                clean_tid,
+            ),
+        )
+        updated = conn.execute("SELECT * FROM relay_tasks WHERE task_id = ?", (clean_tid,)).fetchone()
+        conn.execute("COMMIT")
+        return _format_relay_task(updated)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def list_relay_tasks(
+    task_id: str | None = None,
+    status: str | None = None,
+    active_turn_client: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Query relay tasks by ID, status, or active_turn_client."""
+    conn = connect()
+    try:
+        if task_id and task_id.strip():
+            row = conn.execute("SELECT * FROM relay_tasks WHERE task_id = ?", (task_id.strip(),)).fetchone()
+            return [_format_relay_task(row)] if row else []
+
+        query = "SELECT * FROM relay_tasks WHERE 1=1"
+        params: list[Any] = []
+        if status and status.strip():
+            query += " AND status = ?"
+            params.append(status.strip().lower())
+        if active_turn_client and active_turn_client.strip():
+            query += " AND active_turn_client = ?"
+            params.append(_normalize_agent_client(active_turn_client))
+        query += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        rows = conn.execute(query, params).fetchall()
+        return [_format_relay_task(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def pause_relay_tasks(task_id: str | None = None) -> list[dict[str, Any]]:
+    """Pause a specific active relay task or all active relay tasks (instant kill-switch)."""
+    now = utc_now_iso()
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if task_id and task_id.strip():
+            conn.execute(
+                """
+                UPDATE relay_tasks
+                SET status = 'paused', active_turn_client = 'human', updated_at = ?
+                WHERE task_id = ? AND status IN ('pending', 'in_progress', 'review', 'changes_requested')
+                """,
+                (now, task_id.strip()),
+            )
+            rows = conn.execute("SELECT * FROM relay_tasks WHERE task_id = ?", (task_id.strip(),)).fetchall()
+        else:
+            conn.execute(
+                """
+                UPDATE relay_tasks
+                SET status = 'paused', active_turn_client = 'human', updated_at = ?
+                WHERE status IN ('pending', 'in_progress', 'review', 'changes_requested')
+                """,
+                (now,),
+            )
+            rows = conn.execute("SELECT * FROM relay_tasks WHERE status = 'paused' ORDER BY updated_at DESC").fetchall()
+        conn.execute("COMMIT")
+        return [_format_relay_task(r) for r in rows]
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def resume_relay_task(
+    task_id: str,
+    assign_to_client: str,
+    add_hops: int = 2,
+    note: str = "Resumed by human",
+) -> dict[str, Any]:
+    """Resume a paused or hop-halted relay task, optionally granting extra hops."""
+    clean_tid = (task_id or "").strip()
+    target = _normalize_agent_client(assign_to_client)
+    if target == "human":
+        raise ValueError("assign_to_client must be 'claude-code' or 'antigravity'")
+    extra = max(0, int(add_hops))
+    now = utc_now_iso()
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM relay_tasks WHERE task_id = ?", (clean_tid,)).fetchone()
+        if row is None:
+            raise ValueError(f"Relay task not found: {clean_tid}")
+        new_max = max(int(row["max_hops"]) + extra, int(row["hop_count"]) + max(1, extra))
+        try:
+            history = json.loads(row["history_json"] or "[]")
+        except json.JSONDecodeError:
+            history = []
+        history.append(
+            {
+                "hop": int(row["hop_count"]),
+                "by_client": "human",
+                "assigned_to": target,
+                "status": "in_progress",
+                "summary": (note or "Resumed by human").strip(),
+                "at": now,
+            }
+        )
+        conn.execute(
+            """
+            UPDATE relay_tasks
+            SET active_turn_client = ?, status = 'in_progress', max_hops = ?,
+                history_json = ?, last_summary = ?, updated_at = ?
+            WHERE task_id = ?
+            """,
+            (
+                target,
+                new_max,
+                json.dumps(history, ensure_ascii=False),
+                (note or "Resumed by human").strip(),
+                now,
+                clean_tid,
+            ),
+        )
+        updated = conn.execute("SELECT * FROM relay_tasks WHERE task_id = ?", (clean_tid,)).fetchone()
+        conn.execute("COMMIT")
+        return _format_relay_task(updated)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def cleanup_relay_worktree(task_id: str, delete_branch: bool = False) -> dict[str, Any]:
+    """Remove a completed/paused relay task's git worktree safely (refuses if uncommitted edits exist)."""
+    rows = list_relay_tasks(task_id=task_id)
+    if not rows:
+        raise ValueError(f"Relay task not found: {task_id}")
+    task = rows[0]
+    wt = task.get("worktree_path") or ""
+    repo = task.get("repo_path") or ""
+    branch = task.get("branch_name") or ""
+    if not wt or not Path(wt).exists():
+        return {"task_id": task_id, "removed": False, "reason": "worktree_not_present"}
+
+    dirty = subprocess.run(
+        ["git", "-C", wt, "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if dirty.returncode == 0 and dirty.stdout.strip():
+        raise ValueError(f"Refusing to remove dirty worktree '{wt}' with uncommitted changes.")
+
+    rm = subprocess.run(
+        ["git", "-C", repo, "worktree", "remove", wt],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if rm.returncode != 0:
+        raise ValueError(f"git worktree remove failed: {rm.stderr.strip()}")
+
+    branch_deleted = False
+    if delete_branch and branch:
+        br = subprocess.run(
+            ["git", "-C", repo, "branch", "-d", branch],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        branch_deleted = br.returncode == 0
+
+    return {"task_id": task_id, "removed": True, "worktree_path": wt, "branch_deleted": branch_deleted}
+
+
+def watch_for_wakeup(
+    client: str,
+    convo_id: str = "",
+    task_id: str | None = None,
+    timeout_seconds: float = 1800.0,
+    poll_interval: float = 0.5,
+) -> dict[str, Any]:
+    """Block at zero LLM tokens until a relay turn is assigned to `client`, a task halts/completes, or inbox messages arrive."""
+    target_client = _normalize_agent_client(client)
+    if target_client == "human":
+        raise ValueError("watch client must be 'claude-code' or 'antigravity'")
+
+    watch_started_iso = utc_now_iso()
+    deadline = time.monotonic() + max(0.2, float(timeout_seconds))
+    step = max(0.1, min(5.0, float(poll_interval)))
+    clean_convo = convo_id.strip() if convo_id else ""
+
+    while True:
+        conn = connect()
+        try:
+            if task_id and task_id.strip():
+                t_rows = conn.execute(
+                    "SELECT * FROM relay_tasks WHERE task_id = ?",
+                    (task_id.strip(),),
+                ).fetchall()
+            else:
+                t_rows = conn.execute(
+                    "SELECT * FROM relay_tasks ORDER BY updated_at DESC LIMIT 10"
+                ).fetchall()
+
+            for r in t_rows:
+                if r["active_turn_client"] == target_client and r["status"] in _ACTIVE_RELAY_STATUSES:
+                    return {
+                        "woke_on": "relay_turn",
+                        "client": target_client,
+                        "relay_task": _format_relay_task(r),
+                    }
+                if r["status"] in _TERMINAL_OR_HALTED_STATUSES and r["updated_at"] >= watch_started_iso:
+                    return {
+                        "woke_on": f"relay_{r['status']}",
+                        "client": target_client,
+                        "relay_task": _format_relay_task(r),
+                    }
+        finally:
+            conn.close()
+
+        if clean_convo:
+            msgs = pop_undelivered_messages(clean_convo, client=target_client)
+            if msgs:
+                return {
+                    "woke_on": "messages",
+                    "client": target_client,
+                    "messages": msgs,
+                }
+
+        if time.monotonic() >= deadline:
+            return {
+                "woke_on": "timeout",
+                "client": target_client,
+                "waited_seconds": timeout_seconds,
+            }
+        time.sleep(step)
